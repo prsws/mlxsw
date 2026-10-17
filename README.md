@@ -6,7 +6,7 @@ It shows which models are cached, which are running on which port, whether each 
 
 Built for a Mac Studio (M1 Ultra, 64 GB) that serves up to three slots of different sizes.
 
-> **Status:** a status view, plus **stopping** a slot's server. Starting and switching models are still being built.
+> **Status:** a status view, plus **starting** and **stopping** a slot's server. Switching (stop + start in one step) is next.
 
 ## Requirements
 
@@ -61,10 +61,49 @@ A full-screen shell with the live status on top, an output log, and a command bo
 |------------|------------|--------------|
 | `/help`    | `/h`, `/?` | list the commands |
 | `/refresh` | `/r`       | re-read the model list and status now (also Ctrl+R) |
+| `/start SLOT MODEL` |    | start a model that's on disk in an empty slot; asks for an API key (default `none`), then y/N (see below) |
 | `/stop SLOT` |          | stop the server in a slot; asks first (see below) |
 | `/quit`    | `/q`, `/exit` | leave (also Ctrl+Q) |
 
-`/start` and `/switch` will arrive here as they're built.
+`/switch` will arrive here when it's built.
+
+### Starting a model
+
+```sh
+mlxsw.py start SMALL gemma-4-e2b-4bit     # alias or HF repo, as listed on disk
+mlxsw.py start SMALL gemma-4-e2b-4bit -y  # no questions (see the API key below)
+```
+
+In the shell it's `/start SMALL gemma-4-e2b-4bit`; Tab completes slot and model names.
+
+Before asking anything, mlxsw checks that:
+
+- the model is **on disk** (mlxsw never downloads; use `rapid-mlx pull` first);
+- the slot is **empty** and its port is free (stop the old server first);
+- it will probably **fit**: if the model is bigger than free + reclaimable memory, you get a warning, and you can still go ahead.
+
+Then it shows the slot, the model and its size (next to the slot's hint), who will be able to reach the server, the exact command, and where the log goes. It asks for an **API key**, then for confirmation.
+
+Every start uses the slot's `args` from the config, plus these, which can't be changed:
+
+| Option | Why |
+|---|---|
+| `--port <slot port>` | always explicit, so the server can't drift to another port |
+| `--disable-model-downloads` | the server never downloads a model, even if a client asks for one |
+| `--log-file ~/Library/Logs/mlxsw/SLOT.log` | a fresh log on every start, visible in Console.app |
+
+The server runs in the background, detached from your terminal, and keeps running after mlxsw exits. mlxsw waits until it answers (up to 5 minutes; Ctrl-C stops the waiting, not the server). If it exits while starting, mlxsw shows the end of its log.
+
+#### API key
+
+Every server mlxsw starts has an API key.
+
+- You're asked for it on every start, with typing hidden. **Enter uses the default key, the literal four-character string `none`**, which is what many OpenAI-style clients send for local servers.
+- Clients must send the key as `Authorization: Bearer <key>`. **A client that sends no key at all gets `401 Unauthorized`**, even with the default `none`. Set the key to `none` in each client's settings.
+- Your own key goes to the server through the `RAPID_MLX_API_KEY` environment variable, **never** on the command line, so it doesn't appear in `ps`, in the log or on screen. mlxsw never stores it. (The default `none` is public, so mlxsw shows it.)
+- The server always gets exactly the key chosen at start; a `RAPID_MLX_API_KEY` set in your shell is ignored, except with `-y`.
+- With `-y` there's no question: the key comes from `RAPID_MLX_API_KEY` if your shell has it, otherwise `none`.
+- A server with a key shows as `● serving 🔒key`, since mlxsw's own status check is refused without it.
 
 ### Stopping a slot
 
@@ -120,7 +159,8 @@ These are the built-in defaults. To use your own, create `~/.config/mlxsw/slots.
 ```json
 {
   "slots": [
-    { "name": "LARGE",  "port": 8000, "hint": "~30B" },
+    { "name": "LARGE",  "port": 8000, "hint": "~30B",
+      "args": ["--host", "0.0.0.0", "--trusted-hosts", "localhost", "127.0.0.1", "192.168.1.20"] },
     { "name": "MIDDLE", "port": 8001, "hint": "~12B" },
     { "name": "SMALL",  "port": 8002, "hint": "~2-4B" }
   ]
@@ -128,6 +168,7 @@ These are the built-in defaults. To use your own, create `~/.config/mlxsw/slots.
 ```
 
 - `name` and `port` are required; `hint` is optional and shows next to an empty slot.
+- `args` is optional: extra `rapid-mlx serve` options used when mlxsw **starts** a model in that slot. Without it, the server is reachable from this Mac only (rapid-mlx's default host, `127.0.0.1`). The example opens LARGE to the network and accepts requests addressed to the Mac's IP; use your own IP there. `--port`, `--log-file`, `--disable-model-downloads` and `--api-key` aren't allowed here, because mlxsw sets the first three itself and asks for the key at start.
 - Names are shown in capitals, and each name and port can only be used once.
 - If the file has a mistake, mlxsw stops and says what's wrong instead of guessing.
 - `--json` output and the TUI's first message both say where the slots came from.
@@ -178,8 +219,8 @@ Everything `rapid-mlx ls` reports. Chat LLMs come first, then aux models (embedd
 - [x] Slot layout in a config file
 - [x] Warning when a loaded model is mostly out of RAM
 - [x] Stop a slot's server (`stop` / `/stop`)
-- [ ] Start a model in a slot (launch settings and memory check still to be decided)
-- [ ] Switch a slot to another model
+- [x] Start a model in a slot (`start` / `/start`), always with an API key (default `none`)
+- [ ] Switch a slot to another model in one step
 
 ## License
 

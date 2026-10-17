@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """mlxsw - rapid-mlx model switcher for the Mac Studio.
 
-Status view, plus stopping a slot's server.
+Status view, plus stopping and starting slot servers.
   - `rapid-mlx ls`  -> models in the HF cache
   - `rapid-mlx ps`  -> running servers (pid, port, model, uptime)
   - GET :PORT/v1/models -> is the server actually answering?
@@ -13,9 +13,12 @@ Usage:
   mlxsw.py --json       dump the collected state as JSON
   mlxsw.py tui [-w N]   interactive shell (optional; needs `pip install textual`)
   mlxsw.py stop SLOT    stop the server in a slot (asks first; -y skips)
+  mlxsw.py start SLOT MODEL
+                        start a model that's on disk in an empty slot (asks for
+                        an API key (default "none"), then for confirmation; -y skips)
 
-Stdlib only (the optional tui excepted). The only thing that changes
-anything is `stop`, which asks first and never force-kills.
+Stdlib only (the optional tui excepted). Only `stop` and `start` change
+anything; both ask first. `stop` never force-kills; `start` never downloads.
 """
 import argparse
 import json
@@ -26,6 +29,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 
 # Resolved from PATH at startup by find_rapid_mlx(); never hard-coded.
@@ -34,10 +38,13 @@ RAPID_MLX = None
 # Slot layout. Read from slots.json in the config folder by load_slots();
 # these defaults apply only when that file doesn't exist.
 DEFAULT_SLOTS = [
-    {"name": "LARGE", "port": 8000, "hint": "~30B"},
-    {"name": "MIDDLE", "port": 8001, "hint": "~12B"},
-    {"name": "SMALL", "port": 8002, "hint": "~2-4B"},
+    {"name": "LARGE", "port": 8000, "hint": "~30B", "args": []},
+    {"name": "MIDDLE", "port": 8001, "hint": "~12B", "args": []},
+    {"name": "SMALL", "port": 8002, "hint": "~2-4B", "args": []},
 ]
+
+# Flags `start` always sets itself; a slot's "args" may not contain them.
+RESERVED_ARGS = ("--port", "--log-file", "--disable-model-downloads", "--api-key", "--listen-fd")
 SLOTS = DEFAULT_SLOTS
 CONFIG_SOURCE = "built-in defaults"
 
@@ -120,20 +127,28 @@ def parse_ps(text):
 
 
 def probe(port, timeout=2.0):
-    """Ask the server what it is serving. None = not answering."""
+    """Ask the server what it is serving. None = not answering.
+
+    A server started with an API key refuses us (401/403); that still means
+    it's up and serving, we just can't see its model list."""
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=timeout) as r:
             data = json.load(r).get("data", [])
         return {
             "ids": [d.get("id") for d in data],
             "moe": any(d.get("is_moe") for d in data),
+            "auth": False,
         }
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return {"ids": [], "moe": False, "auth": True}
+        return None
     except Exception:
         return None
 
 
 def proc_info(pid):
-    out = run(["/bin/ps", "-o", "rss=,command=", "-p", str(pid)], timeout=5).strip()
+    out = run(["/bin/ps", "-ww", "-o", "rss=,command=", "-p", str(pid)], timeout=5).strip()
     if not out or out.startswith("__error__"):
         return None
     rss_kb, _, command = out.partition(" ")
@@ -211,6 +226,15 @@ def load_slots(path=None):
             bad(f"slot {name!r} needs a \"port\" between 1 and 65535")
         if not isinstance(hint, str):
             bad(f"slot {name!r}: \"hint\" must be text")
+        args = s.get("args", [])
+        if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+            bad(f"slot {name!r}: \"args\" must be a list of strings")
+        for a in args:
+            flag = a.split("=", 1)[0]
+            if flag in RESERVED_ARGS:
+                why = ("the API key is asked for at start, never stored"
+                       if flag == "--api-key" else "mlxsw sets it itself")
+                bad(f"slot {name!r}: {flag} can't go in \"args\" ({why})")
         name = name.strip().upper()
         if name in names:
             bad(f"slot name {name!r} is used twice")
@@ -218,7 +242,7 @@ def load_slots(path=None):
             bad(f"port {port} is used by two slots")
         names.add(name)
         ports.add(port)
-        slots.append({"name": name, "port": port, "hint": hint})
+        slots.append({"name": name, "port": port, "hint": hint, "args": list(args)})
     return slots, path
 
 
@@ -362,6 +386,8 @@ def render(st, version="", live="", cols=None):
         if s.get("resident") is not None and s["resident"] < RESIDENT_WARN:
             row += yellow(f" ⚠ {s['resident']:.0%} in RAM")
             squeezed = True
+        if api and api.get("auth"):
+            row += dim(" 🔒key")
         if api and api["moe"]:
             row += dim(" MoE")
         if proc and proc["embedding"]:
@@ -517,6 +543,181 @@ def cmd_stop(target, assume_yes=False):
     return 0 if stop_server(srv) else 1
 
 
+START_TIMEOUT = 300.0
+
+# Every server mlxsw starts has an API key. Enter at the prompt means this one:
+# the literal four-character string many OpenAI-style clients send by default.
+DEFAULT_API_KEY = "none"
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+
+def log_dir():
+    return os.path.join(os.path.expanduser("~"), "Library", "Logs", "mlxsw")
+
+
+def find_model(name, models):
+    """A model on disk by alias, HF repo, or the repo's short name (any case).
+    Returns (model, problem)."""
+    n = name.strip().lower()
+    for m in models:
+        if (m["alias"] or "").lower() == n or m["repo"].lower() == n:
+            return m, None
+    short = [m for m in models if m["repo"].lower().split("/")[-1] == n]
+    if len(short) == 1:
+        return short[0], None
+    if len(short) > 1:
+        return None, f"{name!r} matches more than one model: " + ", ".join(m["repo"] for m in short)
+    return None, (f"{name!r} is not on disk. mlxsw never downloads; "
+                  f"get it first with:  rapid-mlx pull <hf-repo>")
+
+
+def _host_of(args):
+    for i, a in enumerate(args):
+        if a == "--host" and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith("--host="):
+            return a.split("=", 1)[1]
+    return "127.0.0.1"                     # rapid-mlx's own default
+
+
+def plan_start(target, model_name):
+    """Check everything before starting. Returns (plan, problem); one is None."""
+    t = resolve_target(target)
+    if not t:
+        names = ", ".join(s["name"] for s in SLOTS)
+        return None, f"no slot called {target!r}. Slots: {names} (or give a port number)."
+    slot = next((s for s in SLOTS if s["port"] == t["port"]), None)
+    models = parse_ls(run([RAPID_MLX, "ls"], timeout=60))
+    m, problem = find_model(model_name, models)
+    if not m:
+        return None, problem
+    if not m["alias"] and m["repo_truncated"]:
+        return None, (f"{m['repo']} has no alias and its name is cut short in `rapid-mlx ls`, "
+                      f"so it can't be started by name. Give it an alias with `rapid-mlx alias`.")
+    srv = server_on(t["port"])
+    if srv:
+        return None, (f"{t['name']} :{t['port']} is already serving {srv['model']} "
+                      f"(pid {srv['pid']}). Stop it first.")
+    if _port_in_use(t["port"]):
+        return None, f"port {t['port']} is in use by something that isn't a rapid-mlx server."
+
+    serve_name = m["alias"] or m["repo"]
+    args = list(slot["args"]) if slot else []
+    log = os.path.join(log_dir(), (t["name"] if slot else f"port-{t['port']}") + ".log")
+    cmd = [RAPID_MLX, "serve", serve_name, *args, "--port", str(t["port"]),
+           "--disable-model-downloads", "--log-file", log]
+
+    warnings = []
+    mem = memory()
+    if mem.get("total"):
+        avail = mem["free"] + mem["cache"]
+        if m["size"] > avail:
+            warnings.append(f"it may not fit: the model is {human(m['size'])} on disk, and only about "
+                            f"{human(avail)} is free or reclaimable right now")
+    if m["aux"]:
+        warnings.append("this looks like an auxiliary model (embedder, speech, drafter), not a chat model")
+    return {"name": t["name"], "port": t["port"], "model": serve_name, "size": m["size"],
+            "hint": slot["hint"] if slot else "", "host": _host_of(args), "log": log,
+            "cmd": cmd, "warnings": warnings}, None
+
+
+def describe_plan(p):
+    """Lines shown before asking to start."""
+    hint = f"; slot hint {p['hint']}" if p["hint"] else ""
+    where = ("this Mac only" if p["host"] in LOOPBACK
+             else f"the network (--host {p['host']})")
+    shown = ["rapid-mlx"] + p["cmd"][1:]
+    lines = [f"{p['name']} :{p['port']}  ←  {p['model']}  ({human(p['size'])} on disk{hint})",
+             f"reachable from: {where}",
+             f"command: {' '.join(shown)}",
+             f"log: {p['log'].replace(os.path.expanduser('~'), '~', 1)}"]
+    lines += [f"⚠ {w}" for w in p["warnings"]]
+    return lines
+
+
+def key_label(api_key):
+    if api_key == DEFAULT_API_KEY:
+        return f'"{DEFAULT_API_KEY}" (the default; clients send it as their API key)'
+    return "your own (not shown, not saved)"
+
+
+def launch(p, api_key=None):
+    """Start the server in the background, detached from this terminal.
+    The API key goes through the environment, never the command line."""
+    os.makedirs(os.path.dirname(p["log"]), exist_ok=True)
+    env = dict(os.environ)
+    # Always exactly the key chosen at start, never one inherited from the shell.
+    env["RAPID_MLX_API_KEY"] = api_key or DEFAULT_API_KEY
+    with open(p["log"], "w") as f:            # a fresh log for every start
+        f.write(f"# started by mlxsw {time.strftime('%Y-%m-%d %H:%M:%S')}: {' '.join(p['cmd'])}\n")
+    out = open(p["log"], "a")                 # catches anything before --log-file takes over
+    try:
+        return subprocess.Popen(p["cmd"], stdin=subprocess.DEVNULL, stdout=out,
+                                stderr=subprocess.STDOUT, env=env, start_new_session=True)
+    finally:
+        out.close()
+
+
+def _tail(path, n=12):
+    try:
+        with open(path, errors="replace") as f:
+            return [ln.rstrip() for ln in f.readlines()[-n:]]
+    except OSError:
+        return []
+
+
+def wait_ready(p, proc, timeout=START_TIMEOUT, say=print):
+    """Wait until the new server answers, or exits, or time runs out."""
+    t0, last = time.time(), 0.0
+    while True:
+        elapsed = time.time() - t0
+        if proc.poll() is not None:
+            say(f"the server exited while starting (code {proc.returncode}). End of {p['log']}:")
+            for ln in _tail(p["log"]):
+                say("  " + ln)
+            return False
+        if probe(p["port"], timeout=1.0):
+            say(f"serving: {p['model']} on {p['name']} :{p['port']} after {elapsed:.0f}s (pid {proc.pid})")
+            return True
+        if elapsed >= timeout:
+            say(f"not answering after {timeout:g}s. It's still running and may still be loading; "
+                f"check {p['log']}")
+            return False
+        if elapsed - last >= 10:
+            say(f"loading … {elapsed:.0f}s")
+            last = elapsed
+        time.sleep(1)
+
+
+def cmd_start(target, model_name, assume_yes=False):
+    p, problem = plan_start(target, model_name)
+    if problem:
+        sys.exit(f"mlxsw: {problem}")
+    for line in describe_plan(p):
+        print(line)
+    if assume_yes:
+        from_env = os.environ.get("RAPID_MLX_API_KEY")
+        api_key = from_env or DEFAULT_API_KEY
+        print(f"API key: {key_label(api_key)}" + (" (from RAPID_MLX_API_KEY)" if from_env else ""))
+    else:
+        if not sys.stdin.isatty():
+            sys.exit("mlxsw: can't ask for confirmation here (not a terminal); add -y to confirm.")
+        import getpass
+        api_key = getpass.getpass(f'API key (hidden; Enter = "{DEFAULT_API_KEY}"): ').strip() or DEFAULT_API_KEY
+        print(f"API key: {key_label(api_key)}")
+        if input("Start it? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("Cancelled; nothing was started.")
+            return 0
+    proc = launch(p, api_key)
+    print(f"started pid {proc.pid}; waiting for it to answer (up to {START_TIMEOUT:g}s; "
+          f"Ctrl-C stops the waiting, not the server) …")
+    try:
+        return 0 if wait_ready(p, proc) else 1
+    except KeyboardInterrupt:
+        print("\nStopped waiting. The server keeps loading in the background.")
+        return 0
+
+
 def find_rapid_mlx():
     """Find rapid-mlx on PATH and check that it runs.
 
@@ -546,20 +747,25 @@ def find_rapid_mlx():
 
 def main():
     ap = argparse.ArgumentParser(description="rapid-mlx slot status and control")
-    ap.add_argument("command", nargs="?", choices=["tui", "stop"],
+    ap.add_argument("command", nargs="?", choices=["tui", "stop", "start"],
                     help="tui: interactive shell (optional, needs `pip install textual`); "
-                         "stop SLOT: stop the server in a slot")
+                         "stop SLOT: stop the server in a slot; "
+                         "start SLOT MODEL: start a model on disk in a slot")
     ap.add_argument("target", nargs="?", metavar="SLOT",
-                    help="slot name or port number (for stop)")
+                    help="slot name or port number (for stop and start)")
+    ap.add_argument("model", nargs="?", metavar="MODEL",
+                    help="model alias or HF repo, as in the list on disk (for start)")
     ap.add_argument("-y", "--yes", action="store_true",
-                    help="stop: don't ask for confirmation")
+                    help='don\'t ask; for start, the API key comes from RAPID_MLX_API_KEY if set, else "none"')
     ap.add_argument("-w", "--watch", nargs="?", const=5.0, type=float, metavar="SECS",
                     help="refresh every SECS seconds (default 5)")
     ap.add_argument("--json", action="store_true", help="print collected state as JSON")
     args = ap.parse_args()
-    if args.command == "stop" and not args.target:
-        ap.error("stop needs a slot name or port, e.g.  mlxsw.py stop SMALL")
-    if args.target and args.command != "stop":
+    if args.command == "stop" and (not args.target or args.model):
+        ap.error("usage: mlxsw.py stop SLOT   e.g.  mlxsw.py stop SMALL")
+    if args.command == "start" and not (args.target and args.model):
+        ap.error("usage: mlxsw.py start SLOT MODEL   e.g.  mlxsw.py start SMALL gemma-4-e2b-4bit")
+    if args.target and args.command not in ("stop", "start"):
         ap.error(f"unexpected argument {args.target!r}")
 
     # Check the optional dependency before touching rapid-mlx, so the
@@ -577,6 +783,8 @@ def main():
 
     if args.command == "stop":
         sys.exit(cmd_stop(args.target, assume_yes=args.yes))
+    if args.command == "start":
+        sys.exit(cmd_start(args.target, args.model, assume_yes=args.yes))
 
     if args.command == "tui":
         import mlxsw_tui

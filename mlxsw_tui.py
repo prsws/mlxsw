@@ -3,7 +3,7 @@
 Started with `mlxsw.py tui`. Needs `pip install textual`; the rest of
 mlxsw keeps working without it.
 
-Commands: /help, /refresh, /stop SLOT, /quit.
+Commands: /help, /refresh, /stop SLOT, /start SLOT MODEL, /quit.
 """
 import time
 
@@ -19,8 +19,9 @@ from textual.widgets import Footer, Input, RichLog, Static
 COMMANDS = {
     "/help": "show this list",
     "/refresh": "re-read the model list and status now",
+    "/start SLOT MODEL": "start a model that's on disk in an empty slot (asks for an API key, default \"none\", then y/N)",
     "/stop SLOT": "stop the server in a slot (asks first; slot name or port)",
-    "/quit": "leave mlxsw (also /exit, Ctrl+Q)",
+    "/quit": "leave mlxsw (also /exit, Ctrl+Q); started servers keep running",
 }
 ALIASES = {"/exit": "/quit", "/q": "/quit", "/h": "/help", "/?": "/help", "/r": "/refresh"}
 PLACEHOLDER = "type / for commands  (Tab completes)"
@@ -60,22 +61,29 @@ class MlxswApp(App):
         self.models = None
         self.models_at = 0.0
         self.tick = 0
-        self.pending = None         # (slot, server) waiting for a y/N answer
-        self.busy = False           # a stop is in progress
+        # A question waiting for an answer:
+        #   ("stop", target, server)        y/N
+        #   ("key", plan)                   API key, hidden; Enter = "none"
+        #   ("start", plan, api_key)        y/N
+        self.pending = None
+        self.busy = False           # a stop or start is in progress
 
     # ------------------------------------------------------------ layout
 
-    def compose(self) -> ComposeResult:
+    def suggestions(self):
         words = [c.split()[0] for c in COMMANDS] + list(ALIASES)
         words += [f"/stop {s['name']}" for s in self.core.SLOTS]
+        names = [m["alias"] or m["repo"] for m in (self.models or []) if not m["aux"]]
+        words += [f"/start {s['name']} {n}" for s in self.core.SLOTS for n in names]
+        words += [f"/start {s['name']}" for s in self.core.SLOTS]
+        return words
+
+    def compose(self) -> ComposeResult:
         with VerticalScroll(id="status-wrap"):
             yield Static("reading rapid-mlx …", id="status")
         yield RichLog(id="log", wrap=True, markup=True)
-        yield CommandInput(
-            placeholder=PLACEHOLDER,
-            id="cmd",
-            suggester=SuggestFromList(words, case_sensitive=False),
-        )
+        yield CommandInput(placeholder=PLACEHOLDER, id="cmd",
+                           suggester=SuggestFromList(self.suggestions(), case_sensitive=False))
         yield Footer()
 
     def on_mount(self) -> None:
@@ -94,8 +102,11 @@ class MlxswApp(App):
     def refresh_status(self, force_models: bool = False) -> None:
         core = self.core
         if force_models or self.models is None or time.time() - self.models_at > 60:
+            first = self.models is None
             self.models = core.parse_ls(core.run([core.RAPID_MLX, "ls"], timeout=60))
             self.models_at = time.time()
+            if first:   # model names are known now: offer them for /start
+                self.call_from_thread(self._update_suggestions)
         state = core.collect([dict(m) for m in self.models])
         dot = "●" if self.tick % 2 == 0 else "○"
         self.tick += 1
@@ -103,6 +114,9 @@ class MlxswApp(App):
         width = max(self.query_one("#status").size.width, 60)
         frame = core.render(state, self.version, live, cols=width)
         self.call_from_thread(self.query_one("#status", Static).update, Text.from_ansi(frame))
+
+    def _update_suggestions(self) -> None:
+        self.query_one("#cmd", Input).suggester = SuggestFromList(self.suggestions(), case_sensitive=False)
 
     def action_refresh_now(self) -> None:
         self.say("refreshing …")
@@ -120,8 +134,18 @@ class MlxswApp(App):
     def say_from_thread(self, text: str) -> None:
         self.call_from_thread(self.say_plain, text)
 
-    def set_placeholder(self, text: str) -> None:
-        self.query_one("#cmd", Input).placeholder = text
+    def ask(self, question: str, placeholder: str, pending, secret: bool = False) -> None:
+        self.pending = pending
+        cmd = self.query_one("#cmd", Input)
+        cmd.password = secret
+        cmd.placeholder = placeholder
+        self.say(f"[yellow]{escape(question)}[/]")
+
+    def clear_question(self) -> None:
+        self.pending = None
+        cmd = self.query_one("#cmd", Input)
+        cmd.password = False
+        cmd.placeholder = PLACEHOLDER
 
     # ------------------------------------------------------------ stop
 
@@ -139,12 +163,9 @@ class MlxswApp(App):
             return
         for line in core.describe_server(t, srv):
             self.say_from_thread(line)
-        self.call_from_thread(self._ask_stop, t, srv)
-
-    def _ask_stop(self, t, srv) -> None:
-        self.pending = (t, srv)
-        self.say(f"[yellow]Stop {escape(t['name'])}? Type y to confirm; anything else cancels.[/]")
-        self.set_placeholder(f"y = stop {t['name']} :{t['port']}   anything else = cancel")
+        self.call_from_thread(self.ask, f"Stop {t['name']}? Type y to confirm; anything else cancels.",
+                              f"y = stop {t['name']} :{t['port']}   anything else = cancel",
+                              ("stop", t, srv))
 
     @work(thread=True, group="action")
     def do_stop(self, t, srv) -> None:
@@ -157,23 +178,68 @@ class MlxswApp(App):
             self.say_from_thread(f"{t['name']} was not stopped cleanly; see above.")
         self.call_from_thread(self.refresh_status)
 
+    # ------------------------------------------------------------ start
+
+    @work(thread=True, group="action")
+    def prepare_start(self, target: str, model: str) -> None:
+        plan, problem = self.core.plan_start(target, model)
+        if problem:
+            self.say_from_thread(problem)
+            return
+        for line in self.core.describe_plan(plan):
+            self.say_from_thread(line)
+        default = self.core.DEFAULT_API_KEY
+        self.call_from_thread(self.ask, f'API key for this server? Typing is hidden; Enter = "{default}".',
+                              f'API key (hidden)   Enter = "{default}"', ("key", plan), True)
+
+    @work(thread=True, group="action")
+    def do_start(self, plan, api_key) -> None:
+        core = self.core
+        self.busy = True
+        try:
+            proc = core.launch(plan, api_key)
+            self.say_from_thread(f"started pid {proc.pid}; waiting for it to answer "
+                                 f"(up to {core.START_TIMEOUT:g}s) …")
+            ok = core.wait_ready(plan, proc, say=self.say_from_thread)
+        except Exception as e:                      # never leave busy stuck
+            self.say_from_thread(f"start failed: {e}")
+            ok = False
+        finally:
+            self.busy = False
+        if not ok:
+            self.say_from_thread(f"{plan['name']} did not come up cleanly; see above.")
+        self.call_from_thread(self.refresh_status)
+
     # ------------------------------------------------------------ input
+
+    def answer(self, raw: str) -> None:
+        """Handle the reply to whichever question is pending."""
+        kind, *rest = self.pending
+        if kind == "key":
+            (plan,) = rest
+            api_key = raw or self.core.DEFAULT_API_KEY
+            self.clear_question()
+            self.say(f"[dim]›[/] API key: {self.core.key_label(api_key)}")   # never the key itself
+            self.ask(f"Start {plan['model']} in {plan['name']}? Type y to confirm; anything else cancels.",
+                     f"y = start {plan['name']} :{plan['port']}   anything else = cancel",
+                     ("start", plan, api_key))
+            return
+        self.clear_question()
+        self.say(f"[dim]›[/] {escape(raw)}")
+        yes = raw.lower() in ("y", "yes")
+        if kind == "stop":
+            t, srv = rest
+            self.do_stop(t, srv) if yes else self.say("Cancelled; nothing was stopped.")
+        elif kind == "start":
+            plan, api_key = rest
+            self.do_start(plan, api_key) if yes else self.say("Cancelled; nothing was started.")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         raw = event.value.strip()
         event.input.value = ""
-
-        if self.pending:                          # answering "Stop X?"
-            t, srv = self.pending
-            self.pending = None
-            self.set_placeholder(PLACEHOLDER)
-            self.say(f"[dim]›[/] {escape(raw)}")
-            if raw.lower() in ("y", "yes"):
-                self.do_stop(t, srv)
-            else:
-                self.say("Cancelled; nothing was stopped.")
+        if self.pending:
+            self.answer(raw)
             return
-
         if not raw:
             return
         self.say(f"[dim]›[/] {escape(raw)}")
@@ -185,19 +251,24 @@ class MlxswApp(App):
         cmd = ALIASES.get(word, word)
         if cmd == "/help":
             for name, text in COMMANDS.items():
-                self.say(f"  [b]{escape(name):<11}[/b] {text}")
+                self.say(f"  [b]{escape(name):<18}[/b] {text}")
         elif cmd == "/refresh":
             self.action_refresh_now()
+        elif cmd in ("/stop", "/start") and self.busy:
+            self.say("Another stop or start is in progress; wait for it to finish.")
         elif cmd == "/stop":
             if len(parts) != 2:
                 self.say("Usage: /stop SLOT   (a slot name like SMALL, or a port like 8002)")
-            elif self.busy:
-                self.say("A stop is already in progress; wait for it to finish.")
             else:
                 self.prepare_stop(parts[1])
+        elif cmd == "/start":
+            if len(parts) != 3:
+                self.say("Usage: /start SLOT MODEL   (Tab completes slot and model names)")
+            else:
+                self.prepare_start(parts[1], parts[2])
         elif cmd == "/quit":
             if self.busy:
-                self.say("[yellow]A stop is in progress; quitting now won't undo it.[/]")
+                self.say("[yellow]A stop or start is in progress; it carries on without mlxsw.[/]")
             self.exit()
         else:
             self.say(f"[red]Unknown command {escape(word)}.[/] Try /help.")
