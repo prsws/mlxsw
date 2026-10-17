@@ -6,7 +6,7 @@ It shows which models are cached, which are running on which port, whether each 
 
 Built for a Mac Studio (M1 Ultra, 64 GB) that serves up to three slots of different sizes.
 
-> **Status:** step 1, a **read-only** status view. It never starts, stops or changes anything. Switching models is the next step and is still being designed.
+> **Status:** a status view, plus **stopping** a slot's server. Starting and switching models are still being built.
 
 ## Requirements
 
@@ -61,9 +61,30 @@ A full-screen shell with the live status on top, an output log, and a command bo
 |------------|------------|--------------|
 | `/help`    | `/h`, `/?` | list the commands |
 | `/refresh` | `/r`       | re-read the model list and status now (also Ctrl+R) |
+| `/stop SLOT` |          | stop the server in a slot; asks first (see below) |
 | `/quit`    | `/q`, `/exit` | leave (also Ctrl+Q) |
 
-The shell is read-only for now, like the rest of mlxsw. `/stop`, `/start` and `/switch` will arrive here as they're built.
+`/start` and `/switch` will arrive here as they're built.
+
+### Stopping a slot
+
+```sh
+mlxsw.py stop SMALL        # asks before stopping
+mlxsw.py stop small -y     # no question; slot names are case-insensitive
+mlxsw.py stop 8002         # a port number works too, even outside your slots
+```
+
+In the shell it's `/stop SMALL`, then `y` to confirm (anything else cancels).
+
+Before asking, mlxsw shows what it's about to stop, including the server's **full launch command**, so you can copy it to start the server again later.
+
+When you confirm, it:
+
+1. checks the PID really is a `rapid-mlx serve` process, and refuses otherwise;
+2. sends it a polite stop signal (SIGTERM);
+3. waits up to 30 s until the process has exited **and** its port is free.
+
+It never force-kills. If the server doesn't stop in time (for example, while it's busy with a long request), mlxsw says so and gives you the `kill -9` command to use yourself if it's really stuck.
 
 If Textual isn't installed, `mlxsw.py tui` says so and stops. The other modes never need it.
 
@@ -150,13 +171,15 @@ Everything `rapid-mlx ls` reports. Chat LLMs come first, then aux models (embedd
 
 ## Roadmap
 
-- [x] Read-only status view, with live mode
+- [x] Status view, with live mode
 - [x] Activity Monitor–style RAM breakdown
 - [x] Three slots (LARGE / MIDDLE / SMALL)
 - [x] Optional interactive shell (`mlxsw.py tui`)
 - [x] Slot layout in a config file
 - [x] Warning when a loaded model is mostly out of RAM
-- [ ] Switch a slot to another model (stop/start order, memory check, restart flags still to be decided)
+- [x] Stop a slot's server (`stop` / `/stop`)
+- [ ] Start a model in a slot (launch settings and memory check still to be decided)
+- [ ] Switch a slot to another model
 
 ## License
 

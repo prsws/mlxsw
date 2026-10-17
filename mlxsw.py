@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """mlxsw - rapid-mlx model switcher for the Mac Studio.
 
-Step 1: read-only status view.
+Status view, plus stopping a slot's server.
   - `rapid-mlx ls`  -> models in the HF cache
   - `rapid-mlx ps`  -> running servers (pid, port, model, uptime)
   - GET :PORT/v1/models -> is the server actually answering?
@@ -12,9 +12,10 @@ Usage:
   mlxsw.py -w [SECS]    live view, refresh every SECS (default 5), Ctrl-C to quit
   mlxsw.py --json       dump the collected state as JSON
   mlxsw.py tui [-w N]   interactive shell (optional; needs `pip install textual`)
+  mlxsw.py stop SLOT    stop the server in a slot (asks first; -y skips)
 
-Stdlib only (the optional tui excepted). Nothing here starts, stops or
-changes anything.
+Stdlib only (the optional tui excepted). The only thing that changes
+anything is `stop`, which asks first and never force-kills.
 """
 import argparse
 import json
@@ -408,6 +409,114 @@ def render(st, version="", live="", cols=None):
 
 # ---------------------------------------------------------------- main
 
+# ---------------------------------------------------------------- actions
+
+STOP_TIMEOUT = 30.0
+
+
+def resolve_target(target):
+    """Slot name (any case) or port number -> {"name", "port"}, or None."""
+    t = str(target).strip()
+    for s in SLOTS:
+        if s["name"] == t.upper():
+            return {"name": s["name"], "port": s["port"]}
+    digits = t.lstrip(":")
+    if digits.isdigit() and 1 <= int(digits) <= 65535:
+        port = int(digits)
+        name = next((s["name"] for s in SLOTS if s["port"] == port), "OTHER")
+        return {"name": name, "port": port}
+    return None
+
+
+def server_on(port):
+    """The rapid-mlx server listed on this port (with its command line), or None."""
+    srv = next((s for s in parse_ps(run([RAPID_MLX, "ps"], timeout=30)) if s["port"] == port), None)
+    if srv:
+        srv["proc"] = proc_info(srv["pid"])
+    return srv
+
+
+def _pid_gone(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    state = run(["/bin/ps", "-o", "stat=", "-p", str(pid)], 5).strip()
+    return state == "" or state.startswith("Z")      # zombie = exited, not yet reaped
+
+
+def _port_in_use(port):
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def stop_server(srv, timeout=STOP_TIMEOUT, say=print):
+    """Politely stop a rapid-mlx server: SIGTERM, then wait until the process
+    has exited and its port is free. Never force-kills. Returns True on success."""
+    import signal
+    pid, port = srv["pid"], srv["port"]
+    command = (srv.get("proc") or {}).get("command", "")
+    if "rapid-mlx" not in command or " serve" not in command:
+        say(f"refusing: pid {pid} doesn't look like a rapid-mlx server "
+            f"({command[:80] or 'no command line found'})")
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        say(f"pid {pid} had already exited")
+    except PermissionError:
+        say(f"not allowed to stop pid {pid} (it belongs to another user)")
+        return False
+    else:
+        say(f"asked pid {pid} to stop; waiting up to {timeout:g}s …")
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if _pid_gone(pid) and not _port_in_use(port):
+            say(f"stopped: pid {pid} exited and port {port} is free ({time.time() - t0:.1f}s)")
+            return True
+        time.sleep(0.5)
+    if not _pid_gone(pid):
+        say(f"pid {pid} is still running after {timeout:g}s (busy with a request?). "
+            f"Nothing was forced. If it's stuck: kill -9 {pid}")
+    else:
+        say(f"pid {pid} exited, but something else is still using port {port}")
+    return False
+
+
+def describe_server(t, srv):
+    """Lines shown before asking to stop a server."""
+    proc = srv.get("proc") or {}
+    lines = [f"{t['name']} :{t['port']}  {srv['model']}  pid {srv['pid']}  up {srv['uptime']}"]
+    if proc.get("command"):
+        lines.append(f"to start it again later: {proc['command']}")
+    return lines
+
+
+def cmd_stop(target, assume_yes=False):
+    t = resolve_target(target)
+    if not t:
+        names = ", ".join(s["name"] for s in SLOTS)
+        sys.exit(f"mlxsw: no slot called {target!r}. Slots: {names} (or give a port number).")
+    srv = server_on(t["port"])
+    if not srv:
+        print(f"Nothing from rapid-mlx is running on {t['name']} :{t['port']}.")
+        return 0
+    for line in describe_server(t, srv):
+        print(line)
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            sys.exit("mlxsw: can't ask for confirmation here (not a terminal); add -y to confirm.")
+        if input("Stop it? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("Cancelled; nothing was stopped.")
+            return 0
+    return 0 if stop_server(srv) else 1
+
+
 def find_rapid_mlx():
     """Find rapid-mlx on PATH and check that it runs.
 
@@ -436,13 +545,22 @@ def find_rapid_mlx():
 
 
 def main():
-    ap = argparse.ArgumentParser(description="rapid-mlx slot status (read-only)")
-    ap.add_argument("command", nargs="?", choices=["tui"],
-                    help="tui: interactive shell (optional, needs `pip install textual`)")
+    ap = argparse.ArgumentParser(description="rapid-mlx slot status and control")
+    ap.add_argument("command", nargs="?", choices=["tui", "stop"],
+                    help="tui: interactive shell (optional, needs `pip install textual`); "
+                         "stop SLOT: stop the server in a slot")
+    ap.add_argument("target", nargs="?", metavar="SLOT",
+                    help="slot name or port number (for stop)")
+    ap.add_argument("-y", "--yes", action="store_true",
+                    help="stop: don't ask for confirmation")
     ap.add_argument("-w", "--watch", nargs="?", const=5.0, type=float, metavar="SECS",
                     help="refresh every SECS seconds (default 5)")
     ap.add_argument("--json", action="store_true", help="print collected state as JSON")
     args = ap.parse_args()
+    if args.command == "stop" and not args.target:
+        ap.error("stop needs a slot name or port, e.g.  mlxsw.py stop SMALL")
+    if args.target and args.command != "stop":
+        ap.error(f"unexpected argument {args.target!r}")
 
     # Check the optional dependency before touching rapid-mlx, so the
     # message is about the real problem.
@@ -456,6 +574,9 @@ def main():
     global RAPID_MLX, SLOTS, CONFIG_SOURCE
     SLOTS, CONFIG_SOURCE = load_slots()
     RAPID_MLX, version = find_rapid_mlx()
+
+    if args.command == "stop":
+        sys.exit(cmd_stop(args.target, assume_yes=args.yes))
 
     if args.command == "tui":
         import mlxsw_tui
