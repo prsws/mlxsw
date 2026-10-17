@@ -30,12 +30,19 @@ import urllib.request
 # Resolved from PATH at startup by find_rapid_mlx(); never hard-coded.
 RAPID_MLX = None
 
-# Slots this box can serve. All three rarely fit in 64 GB at once; that's fine.
-SLOTS = [
+# Slot layout. Read from slots.json in the config folder by load_slots();
+# these defaults apply only when that file doesn't exist.
+DEFAULT_SLOTS = [
     {"name": "LARGE", "port": 8000, "hint": "~30B"},
     {"name": "MIDDLE", "port": 8001, "hint": "~12B"},
     {"name": "SMALL", "port": 8002, "hint": "~2-4B"},
 ]
+SLOTS = DEFAULT_SLOTS
+CONFIG_SOURCE = "built-in defaults"
+
+# A slot whose server holds less than this share of its model in RAM gets a
+# warning: the rest was most likely compressed (or swapped) while idle.
+RESIDENT_WARN = 0.60
 
 # Models that are not chat LLMs: embedders, speech, drafters, tiny assistants.
 AUX_NAME = re.compile(r"embed|whisper|-assistant|-MTP-4bit$", re.I)
@@ -170,6 +177,50 @@ def model_matches(m, name):
     return repo_l == name_l
 
 
+def config_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "mlxsw", "slots.json")
+
+
+def load_slots(path=None):
+    """Return (slots, source). Missing file -> defaults; a broken one -> exit with why."""
+    path = path or config_path()
+    if not os.path.exists(path):
+        return DEFAULT_SLOTS, "built-in defaults"
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        sys.exit(f"mlxsw: can't read slot config {path}:\n  {e}")
+
+    def bad(msg):
+        sys.exit(f"mlxsw: slot config {path}: {msg}")
+
+    raw = data.get("slots") if isinstance(data, dict) else None
+    if not isinstance(raw, list) or not raw:
+        bad('expected {"slots": [ ... ]} with at least one slot')
+    slots, names, ports = [], set(), set()
+    for i, s in enumerate(raw, 1):
+        if not isinstance(s, dict):
+            bad(f"slot #{i} is not an object")
+        name, port, hint = s.get("name"), s.get("port"), s.get("hint", "")
+        if not isinstance(name, str) or not name.strip():
+            bad(f"slot #{i} needs a \"name\"")
+        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+            bad(f"slot {name!r} needs a \"port\" between 1 and 65535")
+        if not isinstance(hint, str):
+            bad(f"slot {name!r}: \"hint\" must be text")
+        name = name.strip().upper()
+        if name in names:
+            bad(f"slot name {name!r} is used twice")
+        if port in ports:
+            bad(f"port {port} is used by two slots")
+        names.add(name)
+        ports.add(port)
+        slots.append({"name": name, "port": port, "hint": hint})
+    return slots, path
+
+
 def collect(models=None):
     if models is None:
         models = parse_ls(run([RAPID_MLX, "ls"], timeout=60))
@@ -199,7 +250,19 @@ def collect(models=None):
             if (s["server"] and model_matches(m, s["server"]["model"]))
             or any(model_matches(m, i) for i in (s["api"] or {}).get("ids", []))
         ]
+
+    # How much of each slot's main model is actually in RAM. The embedder (if
+    # any) only adds to rss, so this errs on the side of not warning.
+    for s in slots:
+        s["model_size"] = s["resident"] = None
+        main = next((m for m in models if not m["aux"] and s["port"] in m["loaded_on"]), None)
+        rss = (s["proc"] or {}).get("rss")
+        if main and rss and main["size"]:
+            s["model_size"] = main["size"]
+            s["resident"] = rss / main["size"]
+
     return {"host": socket.gethostname().split(".")[0], "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "config": CONFIG_SOURCE,
             "memory": memory(), "slots": slots, "models": models}
 
 
@@ -244,7 +307,15 @@ STATUS = {
     "foreign": lambda: magenta("? foreign"),
     "empty": lambda: dim("○ empty"),
 }
-PORT_COLOUR = {8000: cyan, 8001: magenta, 8002: blue}
+SLOT_COLOURS = (cyan, magenta, blue)
+
+
+def port_colour(port):
+    """Colour for a configured slot's port, by its position; other ports plain."""
+    for i, s in enumerate(SLOTS):
+        if s["port"] == port:
+            return SLOT_COLOURS[i % len(SLOT_COLOURS)]
+    return str
 
 
 def render(st, version="", live="", cols=None):
@@ -277,15 +348,19 @@ def render(st, version="", live="", cols=None):
 
     # --- slots
     out.append(bold(" SLOTS"))
+    squeezed = False
     for s in st["slots"]:
         srv, proc, api = s["server"], s["proc"], s["api"]
-        port = PORT_COLOUR.get(s["port"], str)(f":{s['port']}")
+        port = port_colour(s["port"])(f":{s['port']}")
         model = srv["model"] if srv else ((api or {}).get("ids") or ["—"])[0]
         row = f"  {pad(bold(s['name']), 7)} {pad(port, 6)} {pad(STATUS[s['status']](), 10)}  {pad(model, 32)}"
         if srv:
             row += f"  up {pad(srv['uptime'], 8)} pid {pad(str(srv['pid']), 6)}"
         if proc and proc["rss"]:
             row += f" rss {pad(human(proc['rss']), 9)}"
+        if s.get("resident") is not None and s["resident"] < RESIDENT_WARN:
+            row += yellow(f" ⚠ {s['resident']:.0%} in RAM")
+            squeezed = True
         if api and api["moe"]:
             row += dim(" MoE")
         if proc and proc["embedding"]:
@@ -293,6 +368,9 @@ def render(st, version="", live="", cols=None):
         if s["status"] == "empty" and s["hint"]:
             row += dim(f"  ({s['hint']} slot)")
         out.append(row)
+    if squeezed:
+        out.append(yellow("  ⚠ ") + dim("most of that model is out of RAM (compressed or swapped while idle); "
+                                         "its next request will be slow"))
     out.append("")
 
     # --- models on disk
@@ -305,7 +383,7 @@ def render(st, version="", live="", cols=None):
     out.append(dim(f"  {'':6} {pad('ALIAS', aw)}  {pad('HF REPO', rw)}  {'SIZE':>9}  MODIFIED"))
 
     def model_row(m, faint=False):
-        mark = "".join(PORT_COLOUR.get(p, str)(f"▶{p}") for p in m["loaded_on"])
+        mark = "".join(port_colour(p)(f"▶{p}") for p in m["loaded_on"])
         alias = m["alias"] or "(unmapped)"
         text = f"{pad(alias, aw)}  {pad(m['repo'], rw)}  {human(m['size']):>9}  {m['modified']}"
         if m["loaded_on"]:
@@ -375,7 +453,8 @@ def main():
                      "  pip install textual\n"
                      "  (everything else in mlxsw works without it)")
 
-    global RAPID_MLX
+    global RAPID_MLX, SLOTS, CONFIG_SOURCE
+    SLOTS, CONFIG_SOURCE = load_slots()
     RAPID_MLX, version = find_rapid_mlx()
 
     if args.command == "tui":

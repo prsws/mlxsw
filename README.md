@@ -92,7 +92,24 @@ If Textual isn't installed, `mlxsw.py tui` says so and stops. The other modes ne
 | MIDDLE | 8001 | ~12B          |
 | SMALL  | 8002 | ~2–4B         |
 
-All three rarely fit in 64 GB at the same time. They're defined so the capability is there; which ones run is up to you. A server on any other port still shows up, as `OTHER`. Slots are set in the `SLOTS` list at the top of the script.
+All three rarely fit in 64 GB at the same time. They're defined so the capability is there; which ones run is up to you. A server on any other port still shows up, as `OTHER`.
+
+These are the built-in defaults. To use your own, create `~/.config/mlxsw/slots.json` (or `$XDG_CONFIG_HOME/mlxsw/slots.json`):
+
+```json
+{
+  "slots": [
+    { "name": "LARGE",  "port": 8000, "hint": "~30B" },
+    { "name": "MIDDLE", "port": 8001, "hint": "~12B" },
+    { "name": "SMALL",  "port": 8002, "hint": "~2-4B" }
+  ]
+}
+```
+
+- `name` and `port` are required; `hint` is optional and shows next to an empty slot.
+- Names are shown in capitals, and each name and port can only be used once.
+- If the file has a mistake, mlxsw stops and says what's wrong instead of guessing.
+- `--json` output and the TUI's first message both say where the slots came from.
 
 Each slot has one of four statuses:
 
@@ -112,7 +129,7 @@ Memory is counted the way Activity Monitor counts it, from `vm_stat`. The four p
 - **cache**: file cache, which macOS reclaims when needed
 - **free**
 
-The compressed figure is worth watching. A model that has been idle for a while can get pushed into the compressor, and the next request is slower while it gets decompressed. A server whose resident memory is far below its model size is usually the sign.
+The compressed figure is worth watching. A model that has been idle for a while can get pushed into the compressor, and the next request is slower while it gets decompressed. When a slot's server holds less than 60% of its model in RAM, its row gets a warning such as `⚠ 39% in RAM`, with a note underneath explaining it.
 
 ### Models on disk
 
@@ -137,6 +154,8 @@ Everything `rapid-mlx ls` reports. Chat LLMs come first, then aux models (embedd
 - [x] Activity Monitor–style RAM breakdown
 - [x] Three slots (LARGE / MIDDLE / SMALL)
 - [x] Optional interactive shell (`mlxsw.py tui`)
+- [x] Slot layout in a config file
+- [x] Warning when a loaded model is mostly out of RAM
 - [ ] Switch a slot to another model (stop/start order, memory check, restart flags still to be decided)
 
 ## License

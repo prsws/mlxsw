@@ -77,6 +77,7 @@ class MlxswApp(App):
         self.query_one("#log").border_title = "output"
         self.query_one("#cmd", Input).focus()
         self.say("[b]mlxsw[/b] shell (read-only for now). Type [b]/help[/b] for commands.")
+        self.say(f"[dim]slots from {self.core.CONFIG_SOURCE}[/]")
         self.refresh_status(force_models=True)
         self.set_interval(self.interval, self.refresh_status)
 
