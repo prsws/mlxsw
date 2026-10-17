@@ -11,8 +11,10 @@ Usage:
   mlxsw.py              one-shot view
   mlxsw.py -w [SECS]    live view, refresh every SECS (default 5), Ctrl-C to quit
   mlxsw.py --json       dump the collected state as JSON
+  mlxsw.py tui [-w N]   interactive shell (optional; needs `pip install textual`)
 
-Stdlib only. Nothing here starts, stops or changes anything.
+Stdlib only (the optional tui excepted). Nothing here starts, stops or
+changes anything.
 """
 import argparse
 import json
@@ -245,8 +247,8 @@ STATUS = {
 PORT_COLOUR = {8000: cyan, 8001: magenta, 8002: blue}
 
 
-def render(st, version="", live=""):
-    cols = shutil.get_terminal_size((120, 40)).columns
+def render(st, version="", live="", cols=None):
+    cols = cols or shutil.get_terminal_size((120, 40)).columns
     out = []
     mem = st["memory"]
 
@@ -357,13 +359,31 @@ def find_rapid_mlx():
 
 def main():
     ap = argparse.ArgumentParser(description="rapid-mlx slot status (read-only)")
+    ap.add_argument("command", nargs="?", choices=["tui"],
+                    help="tui: interactive shell (optional, needs `pip install textual`)")
     ap.add_argument("-w", "--watch", nargs="?", const=5.0, type=float, metavar="SECS",
                     help="refresh every SECS seconds (default 5)")
     ap.add_argument("--json", action="store_true", help="print collected state as JSON")
     args = ap.parse_args()
 
+    # Check the optional dependency before touching rapid-mlx, so the
+    # message is about the real problem.
+    if args.command == "tui":
+        import importlib.util
+        if importlib.util.find_spec("textual") is None:
+            sys.exit("mlxsw: the tui needs Textual, which isn't installed.\n"
+                     "  pip install textual\n"
+                     "  (everything else in mlxsw works without it)")
+
     global RAPID_MLX
     RAPID_MLX, version = find_rapid_mlx()
+
+    if args.command == "tui":
+        import mlxsw_tui
+        # Hand over this module itself: `import mlxsw` from the tui would
+        # load a second, uninitialised copy when this file runs as __main__.
+        mlxsw_tui.run(sys.modules[__name__], version, args.watch or 5.0)
+        return
 
     if args.json:
         print(json.dumps(collect(), indent=2, default=str))
