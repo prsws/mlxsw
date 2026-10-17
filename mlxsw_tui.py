@@ -37,7 +37,9 @@ class MlxswApp(App):
     TITLE = "mlxsw"
 
     CSS = """
-    #status-wrap { height: 1fr; border: round $primary; padding: 0 1; }
+    /* Always reserve the scrollbar's columns, so the width the status is
+       drawn for doesn't change when the scrollbar comes and goes. */
+    #status-wrap { height: 1fr; border: round $primary; padding: 0 1; scrollbar-gutter: stable; }
     #log { height: 7; border: round $secondary; padding: 0 1; }
     #cmd { margin: 0 0; }
     """
