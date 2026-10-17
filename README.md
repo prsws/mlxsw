@@ -13,6 +13,7 @@ Built for a Mac Studio (M1 Ultra, 64 GB) that serves up to three slots of differ
 - macOS on Apple Silicon
 - Rapid-MLX installed (tested with 0.16.2), with `rapid-mlx` on your `PATH`
 - Python 3.8+ (standard library only, nothing to install)
+- Optional, for the interactive shell only: Python 3.9+ and [Textual](https://textual.textualize.io/) (`pip install -r requirements-tui.txt`)
 
 ## Install
 
@@ -39,6 +40,32 @@ mlxsw.py --json       # collected state as JSON, for scripts
 ```
 
 Set `NO_COLOR=1` to turn off colors.
+
+### Interactive shell (optional)
+
+```sh
+python3 -m pip install -r requirements-tui.txt   # once; installs Textual
+mlxsw.py tui                                     # refresh every 5 s
+mlxsw.py tui -w 2                                # refresh every 2 s
+```
+
+Install Textual for the same `python3` you run mlxsw with. If pip refuses with `externally-managed-environment` (common with Homebrew Python), install into your user folder instead:
+
+```sh
+python3 -m pip install --user --break-system-packages -r requirements-tui.txt
+```
+
+A full-screen shell with the live status on top, an output log, and a command box at the bottom. Type `/` and the matching command appears greyed out; Tab completes it.
+
+| Command    | Short      | What it does |
+|------------|------------|--------------|
+| `/help`    | `/h`, `/?` | list the commands |
+| `/refresh` | `/r`       | re-read the model list and status now (also Ctrl+R) |
+| `/quit`    | `/q`, `/exit` | leave (also Ctrl+Q) |
+
+The shell is read-only for now, like the rest of mlxsw. `/stop`, `/start` and `/switch` will arrive here as they're built.
+
+If Textual isn't installed, `mlxsw.py tui` says so and stops. The other modes never need it.
 
 ## What it shows
 
@@ -109,6 +136,7 @@ Everything `rapid-mlx ls` reports. Chat LLMs come first, then aux models (embedd
 - [x] Read-only status view, with live mode
 - [x] Activity Monitor–style RAM breakdown
 - [x] Three slots (LARGE / MIDDLE / SMALL)
+- [x] Optional interactive shell (`mlxsw.py tui`)
 - [ ] Switch a slot to another model (stop/start order, memory check, restart flags still to be decided)
 
 ## License
