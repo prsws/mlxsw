@@ -6,7 +6,7 @@ It shows which models are cached, which are running on which port, whether each 
 
 Built for a Mac Studio (M1 Ultra, 64 GB) that serves up to three slots of different sizes.
 
-> **Status:** a status view, plus **starting** and **stopping** a slot's server. Switching (stop + start in one step) is next.
+> **Status:** a status view, plus **starting**, **stopping**, **restarting** and **switching** a slot's server.
 
 ## Requirements
 
@@ -62,10 +62,10 @@ A full-screen shell with the live status on top, an output log, and a command bo
 | `/help`    | `/h`, `/?` | list the commands |
 | `/refresh` | `/r`       | re-read the model list and status now (also Ctrl+R) |
 | `/start SLOT MODEL` |    | start a model that's on disk in an empty slot; asks for an API key (default `none`), then y/N (see below) |
+| `/restart SLOT` |       | same model, fresh process; asks first (see below) |
+| `/switch SLOT MODEL` |  | stop the slot's server, start MODEL in it; asks first (see below) |
 | `/stop SLOT` |          | stop the server in a slot; asks first (see below) |
 | `/quit`    | `/q`, `/exit` | leave (also Ctrl+Q) |
-
-`/switch` will arrive here when it's built.
 
 ### Starting a model
 
@@ -103,7 +103,26 @@ Every server mlxsw starts has an API key.
 - Your own key goes to the server through the `RAPID_MLX_API_KEY` environment variable, **never** on the command line, so it doesn't appear in `ps`, in the log or on screen. mlxsw never stores it. (The default `none` is public, so mlxsw shows it.)
 - The server always gets exactly the key chosen at start; a `RAPID_MLX_API_KEY` set in your shell is ignored, except with `-y`.
 - With `-y` there's no question: the key comes from `RAPID_MLX_API_KEY` if your shell has it, otherwise `none`.
-- A server with a key shows as `● serving 🔒key`, since mlxsw's own status check is refused without it.
+- A server with a key shows as `● serving … [key]`, since mlxsw's own status check is refused without it.
+
+### Restarting and switching
+
+```sh
+mlxsw.py restart SMALL                    # same model, fresh process
+mlxsw.py switch LARGE qwen3-coder-30b-4bit
+```
+
+In the shell: `/restart SMALL`, `/switch LARGE qwen3-coder-30b-4bit`.
+
+Both are a stop followed by a start in the same slot:
+
+- **Every question comes first.** You see what will be stopped and what will start, then give the API key and confirm, **before** anything is stopped. After that it runs straight through.
+- **Stop first, then start.** The new server needs the slot's port, so the slot is briefly empty. That's also the order that never needs two big models in memory at once.
+- **The memory check counts the old server's memory as freed**, so swapping one 30B model for another doesn't warn for nothing.
+- **The new server uses the slot's `args` from the config**, not the old server's command line. Restarting a server you started by hand is a way to bring it under mlxsw: logs, no downloads, API key.
+- If the old server **doesn't stop**, nothing is started and the slot keeps what it had.
+- If the new model **fails to start** after a clean stop, the slot is left empty, and mlxsw prints the `start` command that brings back what was there.
+- `restart` of an empty slot is refused (there's nothing to restart). `switch` into an empty slot works like `start`.
 
 ### Stopping a slot
 
@@ -220,7 +239,7 @@ Everything `rapid-mlx ls` reports. Chat LLMs come first, then aux models (embedd
 - [x] Warning when a loaded model is mostly out of RAM
 - [x] Stop a slot's server (`stop` / `/stop`)
 - [x] Start a model in a slot (`start` / `/start`), always with an API key (default `none`)
-- [ ] Switch a slot to another model in one step
+- [x] Restart a slot, or switch it to another model, in one step
 
 ## License
 

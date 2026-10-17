@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """mlxsw - rapid-mlx model switcher for the Mac Studio.
 
-Status view, plus stopping and starting slot servers.
+Status view, plus starting, stopping, restarting and switching slot servers.
   - `rapid-mlx ls`  -> models in the HF cache
   - `rapid-mlx ps`  -> running servers (pid, port, model, uptime)
   - GET :PORT/v1/models -> is the server actually answering?
@@ -16,9 +16,12 @@ Usage:
   mlxsw.py start SLOT MODEL
                         start a model that's on disk in an empty slot (asks for
                         an API key (default "none"), then for confirmation; -y skips)
+  mlxsw.py restart SLOT same model, fresh process (stop, then start)
+  mlxsw.py switch SLOT MODEL
+                        stop the slot's server, then start MODEL in it
 
-Stdlib only (the optional tui excepted). Only `stop` and `start` change
-anything; both ask first. `stop` never force-kills; `start` never downloads.
+Stdlib only (the optional tui excepted). Only stop/start/restart/switch
+change anything; all of them ask first. `stop` never force-kills; `start` never downloads.
 """
 import argparse
 import json
@@ -387,7 +390,7 @@ def render(st, version="", live="", cols=None):
             row += yellow(f" ⚠ {s['resident']:.0%} in RAM")
             squeezed = True
         if api and api.get("auth"):
-            row += dim(" 🔒key")
+            row += dim(" [key]")   # plain text: emoji are 2 columns wide and break alignment
         if api and api["moe"]:
             row += dim(" MoE")
         if proc and proc["embedding"]:
@@ -580,8 +583,12 @@ def _host_of(args):
     return "127.0.0.1"                     # rapid-mlx's own default
 
 
-def plan_start(target, model_name):
-    """Check everything before starting. Returns (plan, problem); one is None."""
+def plan_start(target, model_name, replace=False):
+    """Check everything before starting. Returns (plan, problem); one is None.
+
+    With replace=True (restart/switch) a server already in the slot is not a
+    problem: it goes into plan["old"], to be stopped right before the start,
+    and the memory it holds counts as available."""
     t = resolve_target(target)
     if not t:
         names = ", ".join(s["name"] for s in SLOTS)
@@ -595,10 +602,10 @@ def plan_start(target, model_name):
         return None, (f"{m['repo']} has no alias and its name is cut short in `rapid-mlx ls`, "
                       f"so it can't be started by name. Give it an alias with `rapid-mlx alias`.")
     srv = server_on(t["port"])
-    if srv:
+    if srv and not replace:
         return None, (f"{t['name']} :{t['port']} is already serving {srv['model']} "
-                      f"(pid {srv['pid']}). Stop it first.")
-    if _port_in_use(t["port"]):
+                      f"(pid {srv['pid']}). Stop it first, or use switch / restart.")
+    if not srv and _port_in_use(t["port"]):
         return None, f"port {t['port']} is in use by something that isn't a rapid-mlx server."
 
     serve_name = m["alias"] or m["repo"]
@@ -610,27 +617,47 @@ def plan_start(target, model_name):
     warnings = []
     mem = memory()
     if mem.get("total"):
-        avail = mem["free"] + mem["cache"]
+        freed = ((srv or {}).get("proc") or {}).get("rss") or 0
+        avail = mem["free"] + mem["cache"] + freed
         if m["size"] > avail:
+            extra = f", counting the {human(freed)} the old server frees" if freed else ""
             warnings.append(f"it may not fit: the model is {human(m['size'])} on disk, and only about "
-                            f"{human(avail)} is free or reclaimable right now")
+                            f"{human(avail)} is free or reclaimable right now{extra}")
     if m["aux"]:
         warnings.append("this looks like an auxiliary model (embedder, speech, drafter), not a chat model")
     return {"name": t["name"], "port": t["port"], "model": serve_name, "size": m["size"],
             "hint": slot["hint"] if slot else "", "host": _host_of(args), "log": log,
-            "cmd": cmd, "warnings": warnings}, None
+            "cmd": cmd, "warnings": warnings, "old": srv}, None
+
+
+def plan_restart(target):
+    """Restart = switch the slot to the model it's serving now."""
+    t = resolve_target(target)
+    if not t:
+        return plan_start(target, "", replace=True)          # same "no slot" message
+    srv = server_on(t["port"])
+    if not srv:
+        return None, (f"nothing from rapid-mlx is running on {t['name']} :{t['port']}, "
+                      f"so there's nothing to restart. Use start.")
+    return plan_start(target, srv["model"], replace=True)
 
 
 def describe_plan(p):
-    """Lines shown before asking to start."""
+    """Lines shown before asking to start (or restart / switch)."""
     hint = f"; slot hint {p['hint']}" if p["hint"] else ""
     where = ("this Mac only" if p["host"] in LOOPBACK
              else f"the network (--host {p['host']})")
     shown = ["rapid-mlx"] + p["cmd"][1:]
-    lines = [f"{p['name']} :{p['port']}  ←  {p['model']}  ({human(p['size'])} on disk{hint})",
-             f"reachable from: {where}",
-             f"command: {' '.join(shown)}",
-             f"log: {p['log'].replace(os.path.expanduser('~'), '~', 1)}"]
+    lines = []
+    old = p.get("old")
+    if old:
+        lines.append(f"stops:  {old['model']}  (pid {old['pid']}, up {old['uptime']}); "
+                     f"the slot is empty until the new server answers")
+    lines += [f"{'starts: ' if old else ''}{p['name']} :{p['port']}  ←  {p['model']}  "
+              f"({human(p['size'])} on disk{hint})",
+              f"reachable from: {where}",
+              f"command: {' '.join(shown)}",
+              f"log: {p['log'].replace(os.path.expanduser('~'), '~', 1)}"]
     lines += [f"⚠ {w}" for w in p["warnings"]]
     return lines
 
@@ -689,10 +716,25 @@ def wait_ready(p, proc, timeout=START_TIMEOUT, say=print):
         time.sleep(1)
 
 
-def cmd_start(target, model_name, assume_yes=False):
-    p, problem = plan_start(target, model_name)
-    if problem:
-        sys.exit(f"mlxsw: {problem}")
+def execute(p, api_key, say=print):
+    """Run a confirmed plan: stop the old server if there is one, then start.
+    Returns True when the new server answers."""
+    old = p.get("old")
+    if old:
+        if not stop_server(old, say=say):
+            say(f"the old server was not stopped, so nothing was started; "
+                f"{p['name']} still has {old['model']}.")
+            return False
+    proc = launch(p, api_key)
+    say(f"started pid {proc.pid}; waiting for it to answer (up to {START_TIMEOUT:g}s) …")
+    ok = wait_ready(p, proc, say=say)
+    if not ok and old and proc.poll() is not None:
+        say(f"{p['name']} is now empty. To bring back what it had:  "
+            f"mlxsw.py start {p['name']} {old['model']}")
+    return ok
+
+
+def _confirm_and_run(p, assume_yes, verb):
     for line in describe_plan(p):
         print(line)
     if assume_yes:
@@ -705,17 +747,33 @@ def cmd_start(target, model_name, assume_yes=False):
         import getpass
         api_key = getpass.getpass(f'API key (hidden; Enter = "{DEFAULT_API_KEY}"): ').strip() or DEFAULT_API_KEY
         print(f"API key: {key_label(api_key)}")
-        if input("Start it? [y/N] ").strip().lower() not in ("y", "yes"):
-            print("Cancelled; nothing was started.")
+        if input(f"{verb.capitalize()} it? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("Cancelled; nothing was changed.")
             return 0
-    proc = launch(p, api_key)
-    print(f"started pid {proc.pid}; waiting for it to answer (up to {START_TIMEOUT:g}s; "
-          f"Ctrl-C stops the waiting, not the server) …")
     try:
-        return 0 if wait_ready(p, proc) else 1
+        return 0 if execute(p, api_key) else 1
     except KeyboardInterrupt:
         print("\nStopped waiting. The server keeps loading in the background.")
         return 0
+
+
+def _plan_or_exit(result):
+    p, problem = result
+    if problem:
+        sys.exit(f"mlxsw: {problem}")
+    return p
+
+
+def cmd_start(target, model_name, assume_yes=False):
+    return _confirm_and_run(_plan_or_exit(plan_start(target, model_name)), assume_yes, "start")
+
+
+def cmd_switch(target, model_name, assume_yes=False):
+    return _confirm_and_run(_plan_or_exit(plan_start(target, model_name, replace=True)), assume_yes, "switch")
+
+
+def cmd_restart(target, assume_yes=False):
+    return _confirm_and_run(_plan_or_exit(plan_restart(target)), assume_yes, "restart")
 
 
 def find_rapid_mlx():
@@ -747,14 +805,14 @@ def find_rapid_mlx():
 
 def main():
     ap = argparse.ArgumentParser(description="rapid-mlx slot status and control")
-    ap.add_argument("command", nargs="?", choices=["tui", "stop", "start"],
+    ap.add_argument("command", nargs="?", choices=["tui", "stop", "start", "restart", "switch"],
                     help="tui: interactive shell (optional, needs `pip install textual`); "
-                         "stop SLOT: stop the server in a slot; "
-                         "start SLOT MODEL: start a model on disk in a slot")
+                         "stop SLOT; start SLOT MODEL; restart SLOT (same model, fresh process); "
+                         "switch SLOT MODEL (stop the slot's server, start MODEL)")
     ap.add_argument("target", nargs="?", metavar="SLOT",
-                    help="slot name or port number (for stop and start)")
+                    help="slot name or port number")
     ap.add_argument("model", nargs="?", metavar="MODEL",
-                    help="model alias or HF repo, as in the list on disk (for start)")
+                    help="model alias or HF repo, as in the list on disk (for start and switch)")
     ap.add_argument("-y", "--yes", action="store_true",
                     help='don\'t ask; for start, the API key comes from RAPID_MLX_API_KEY if set, else "none"')
     ap.add_argument("-w", "--watch", nargs="?", const=5.0, type=float, metavar="SECS",
@@ -765,7 +823,11 @@ def main():
         ap.error("usage: mlxsw.py stop SLOT   e.g.  mlxsw.py stop SMALL")
     if args.command == "start" and not (args.target and args.model):
         ap.error("usage: mlxsw.py start SLOT MODEL   e.g.  mlxsw.py start SMALL gemma-4-e2b-4bit")
-    if args.target and args.command not in ("stop", "start"):
+    if args.command == "switch" and not (args.target and args.model):
+        ap.error("usage: mlxsw.py switch SLOT MODEL   e.g.  mlxsw.py switch LARGE qwen3-coder-30b-4bit")
+    if args.command == "restart" and (not args.target or args.model):
+        ap.error("usage: mlxsw.py restart SLOT   e.g.  mlxsw.py restart SMALL")
+    if args.target and args.command not in ("stop", "start", "restart", "switch"):
         ap.error(f"unexpected argument {args.target!r}")
 
     # Check the optional dependency before touching rapid-mlx, so the
@@ -785,6 +847,10 @@ def main():
         sys.exit(cmd_stop(args.target, assume_yes=args.yes))
     if args.command == "start":
         sys.exit(cmd_start(args.target, args.model, assume_yes=args.yes))
+    if args.command == "switch":
+        sys.exit(cmd_switch(args.target, args.model, assume_yes=args.yes))
+    if args.command == "restart":
+        sys.exit(cmd_restart(args.target, assume_yes=args.yes))
 
     if args.command == "tui":
         import mlxsw_tui
