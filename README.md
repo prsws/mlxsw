@@ -1,0 +1,116 @@
+# mlxsw
+
+A small terminal switcher for Rapid-MLX model servers on an Apple Silicon Mac.
+
+It shows which models are cached, which are running on which port, whether each server is actually answering, and how memory is being used. All of it fits on one screen, refreshed live if you want.
+
+Built for a Mac Studio (M1 Ultra, 64 GB) that serves up to three slots of different sizes.
+
+> **Status:** step 1, a **read-only** status view. It never starts, stops or changes anything. Switching models is the next step and is still being designed.
+
+## Requirements
+
+- macOS on Apple Silicon
+- Rapid-MLX installed (tested with 0.16.2), with `rapid-mlx` on your `PATH`
+- Python 3.8+ (standard library only, nothing to install)
+
+## Install
+
+```sh
+git clone https://github.com/prsws/mlxsw.git ~/mlxsw
+chmod +x ~/mlxsw/mlxsw.py
+```
+
+mlxsw finds `rapid-mlx` through your `PATH`. At startup it runs `rapid-mlx version` to make sure the binary works. If `rapid-mlx` isn't found, or the check fails, mlxsw stops with a message saying which. Check where your shell finds it with:
+
+```sh
+command -v rapid-mlx
+```
+
+**Running from an IDE:** PyCharm and other GUI apps often start with a shorter `PATH` than your terminal. If mlxsw says `rapid-mlx` isn't on PATH, add the folder that `command -v rapid-mlx` shows to `PATH` in the run configuration's environment variables.
+
+## Usage
+
+```sh
+mlxsw.py              # one-shot view
+mlxsw.py -w           # live view, refresh every 5 s (Ctrl-C to quit)
+mlxsw.py -w 2         # live view, refresh every 2 s
+mlxsw.py --json       # collected state as JSON, for scripts
+```
+
+Set `NO_COLOR=1` to turn off colors.
+
+## What it shows
+
+```
+ mlxsw · macstudio · rapid-mlx 0.16.2   ● LIVE · every 2s                    2026-10-17 06:56:35
+ RAM █████████████████████████▒▒▒▒▒▒▒▒▒▒▒▒▒░░  used 40.3 GiB of 64.0 GiB
+     ■ mlx 33.4 GiB  ■ other 6.9 GiB (compressed 523.5 MiB, wired 2.2 GiB)  ▒ cache 21.5 GiB  ░ free 2.2 GiB
+
+ SLOTS
+  LARGE   :8000  ● serving   muse-glimmer-30b-4bit   up 39m36s  pid 5547  rss 16.6 GiB  +emb embeddinggemma-2-bf16
+  MIDDLE  :8001  ● serving   gemma-4-12b-qat-4bit    up 1m58s   pid 6942  rss 11.9 GiB
+  SMALL   :8002  ● serving   gemma-4-e2b-4bit        up 1m28s   pid 6944  rss 4.9 GiB
+
+ MODELS ON DISK  10 LLMs · 5 aux · 148.5 GiB total
+  ▶8000  muse-glimmer-30b-4bit   mlx-community/Muse-Glimmer-30B-4bit   18.1 GiB  59d ago
+  ...
+```
+
+### Slots
+
+| Slot   | Port | Intended size |
+|--------|------|---------------|
+| LARGE  | 8000 | ~30B          |
+| MIDDLE | 8001 | ~12B          |
+| SMALL  | 8002 | ~2–4B         |
+
+All three rarely fit in 64 GB at the same time. They're defined so the capability is there; which ones run is up to you. A server on any other port still shows up, as `OTHER`. Slots are set in the `SLOTS` list at the top of the script.
+
+Each slot has one of four statuses:
+
+| Status      | Meaning |
+|-------------|---------|
+| ● serving   | listed by `rapid-mlx ps` **and** answering `GET /v1/models` |
+| ◐ loading   | process is up but the port isn't answering yet (or it's stuck) |
+| ? foreign   | something answers on the port that `rapid-mlx ps` doesn't list |
+| ○ empty     | nothing there |
+
+### RAM bar
+
+Memory is counted the way Activity Monitor counts it, from `vm_stat`. The four parts add up to total RAM:
+
+- **mlx**: combined resident memory of the rapid-mlx server processes
+- **other**: everything else in use (app memory + wired + compressed)
+- **cache**: file cache, which macOS reclaims when needed
+- **free**
+
+The compressed figure is worth watching. A model that has been idle for a while can get pushed into the compressor, and the next request is slower while it gets decompressed. A server whose resident memory is far below its model size is usually the sign.
+
+### Models on disk
+
+Everything `rapid-mlx ls` reports. Chat LLMs come first, then aux models (embedders, Whisper, speculative drafters, anything under 2 GB). Loaded models are marked with their port. A model with no alias shows as `(unmapped)` and can't be started by name with `rapid-mlx serve`.
+
+## How it works
+
+- `rapid-mlx ls` and `rapid-mlx ps` have no JSON output, so their tables are parsed with regular expressions. Long aliases shift the columns and long repo names get truncated with `...`, which the parser handles.
+- Each slot's port is probed with `GET /v1/models` (2-second timeout).
+- `ps -o rss,command` gives each server's memory and its launch flags (such as `--embedding-model`).
+- `sysctl` and `vm_stat` give the memory breakdown.
+- In live mode the model list is re-read once a minute. Everything else is read on every refresh.
+
+## Known quirks
+
+- `rapid-mlx ps` sometimes prints an ASCII logo before its table. The parser skips it.
+- Rapid-MLX is moving fast. If a release changes the `ls` or `ps` table layout, the parser is what will need updating.
+
+## Roadmap
+
+- [x] Read-only status view, with live mode
+- [x] Activity Monitor–style RAM breakdown
+- [x] Three slots (LARGE / MIDDLE / SMALL)
+- [ ] Switch a slot to another model (stop/start order, memory check, restart flags still to be decided)
+
+## License
+
+MIT. See [LICENSE](LICENSE).
