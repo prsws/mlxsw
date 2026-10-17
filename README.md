@@ -8,6 +8,8 @@ Built for a Mac Studio (M1 Ultra, 64 GB) that serves up to three slots of differ
 
 > **Status:** a status view, plus **starting**, **stopping**, **restarting** and **switching** a slot's server.
 
+![mlxsw TUI](images/mlxsw-tui.png)
+
 ## Requirements
 
 - macOS on Apple Silicon
