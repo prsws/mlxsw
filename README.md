@@ -167,7 +167,7 @@ LARGE :8000  serving  qwen3.8-27b-4bit  pid 37356  up 4h58m  [key]
   state     ready · llm · batched
   reach     the network (--host 0.0.0.0), trusted hosts: *
   memory    metal 16.6 GiB now · 19.4 GiB peak · rss 15.5 GiB
-  prefix    5.0 GiB of 9.7 GiB cap · 8 entries · 1 hits / 6 misses · 12.9k tokens saved
+  prefix    5.0 GiB of 9.7 GiB cap · 8 entries · 1 hit / 6 misses · 12.9k tokens saved
   traffic   42 requests · 0 running · 0 waiting · 81.2k prompt / 9.1k completion tokens
   speed     last decode 23.4 tok/s · avg time to first token 0.30s
   command   rapid-mlx serve qwen3.8-27b-4bit --host 0.0.0.0 --trusted-hosts '*' --port 8000 …

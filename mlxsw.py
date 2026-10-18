@@ -594,6 +594,21 @@ def _count(n):
     return f"{n:.0f}"
 
 
+def _n(value, word, plural=None):
+    """'1 request', '3 requests', '- requests' (value as from metrics, may be None)."""
+    one = value is not None and float(value) == 1
+    return f"{_count(value)} {word if one else (plural or word + 's')}"
+
+
+def _from_rapid_mlx(args):
+    """A server's command line starting at `rapid-mlx`, without the Python
+    interpreter (and the full path) that ps shows in front of it."""
+    for i, a in enumerate(args):
+        if os.path.basename(a) == "rapid-mlx":
+            return ["rapid-mlx"] + args[i + 1:]
+    return args
+
+
 def describe_info(slot):
     """Detail lines for one slot of collect(): the long form the status view has no room for."""
     srv, proc, api = slot["server"], slot["proc"] or {}, slot["api"]
@@ -643,19 +658,19 @@ def describe_info(slot):
         if cap or cur:
             pfx = f"{human(cur or 0)} of {human(cap)} cap" if cap else f"{human(cur)}"
             if g("rapid_mlx_prefix_cache_radix_entries") is not None:
-                pfx += f" · {_count(g('rapid_mlx_prefix_cache_radix_entries'))} entries"
-            pfx += (f" · {_count(g('rapid_mlx_prefix_cache_hits_total'))} hits"
-                    f" / {_count(g('rapid_mlx_prefix_cache_misses_total'))} misses"
+                pfx += f" · {_n(g('rapid_mlx_prefix_cache_radix_entries'), 'entry', 'entries')}"
+            pfx += (f" · {_n(g('rapid_mlx_prefix_cache_hits_total'), 'hit')}"
+                    f" / {_n(g('rapid_mlx_prefix_cache_misses_total'), 'miss', 'misses')}"
                     f" · {_count(g('rapid_mlx_prefix_cache_tokens_saved_total'))} tokens saved")
         else:
             pfx = "not in use (no cap, nothing cached)"
         lines.append(label("prefix") + pfx)
 
-        traffic = (f"{_count(g('rapid_mlx_requests_processed_total'))} requests"
+        traffic = (f"{_n(g('rapid_mlx_requests_processed_total'), 'request')}"
                    f" · {_count(g('rapid_mlx_requests_running'))} running"
                    f" · {_count(g('rapid_mlx_requests_waiting'))} waiting"
                    f" · {_count(g('rapid_mlx_prompt_tokens_total'))} prompt"
-                   f" / {_count(g('rapid_mlx_completion_tokens_total'))} completion tokens")
+                   f" / {_n(g('rapid_mlx_completion_tokens_total'), 'completion token')}")
         lines.append(label("traffic") + traffic)
 
         speed = []
@@ -668,7 +683,7 @@ def describe_info(slot):
             lines.append(label("speed") + " · ".join(speed))
 
     if proc.get("command"):
-        lines.append(label("command") + " ".join(shlex.quote(a) for a in args))
+        lines.append(label("command") + " ".join(shlex.quote(a) for a in _from_rapid_mlx(args)))
     log = next((args[i + 1] for i, a in enumerate(args[:-1]) if a == "--log-file"), None)
     if log:                                   # only what this server actually writes to
         lines.append(label("log") + log.replace(os.path.expanduser("~"), "~", 1))
