@@ -27,6 +27,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -40,10 +41,16 @@ RAPID_MLX = None
 
 # Slot layout. Read from slots.json in the config folder by load_slots();
 # these defaults apply only when that file doesn't exist.
+# What a slot gets when it has no "args" of its own. Meant for an internal,
+# protected network: reachable from the LAN, any Host header accepted (every
+# server has an API key). A slot with its own "args" -- even an empty list,
+# which means localhost only -- gets exactly those and nothing from here.
+DEFAULT_ARGS = ["--host", "0.0.0.0", "--trusted-hosts", "*"]
+
 DEFAULT_SLOTS = [
-    {"name": "LARGE", "port": 8000, "hint": "~30B", "args": []},
-    {"name": "MIDDLE", "port": 8001, "hint": "~12B", "args": []},
-    {"name": "SMALL", "port": 8002, "hint": "~2-4B", "args": []},
+    {"name": "LARGE", "port": 8000, "hint": "~30B", "args": list(DEFAULT_ARGS)},
+    {"name": "MIDDLE", "port": 8001, "hint": "~12B", "args": list(DEFAULT_ARGS)},
+    {"name": "SMALL", "port": 8002, "hint": "~2-4B", "args": list(DEFAULT_ARGS)},
 ]
 
 # Flags `start` always sets itself; a slot's "args" may not contain them.
@@ -229,7 +236,7 @@ def load_slots(path=None):
             bad(f"slot {name!r} needs a \"port\" between 1 and 65535")
         if not isinstance(hint, str):
             bad(f"slot {name!r}: \"hint\" must be text")
-        args = s.get("args", [])
+        args = s.get("args", DEFAULT_ARGS)       # explicit args (even []) rule
         if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
             bad(f"slot {name!r}: \"args\" must be a list of strings")
         for a in args:
@@ -522,7 +529,8 @@ def describe_server(t, srv):
     proc = srv.get("proc") or {}
     lines = [f"{t['name']} :{t['port']}  {srv['model']}  pid {srv['pid']}  up {srv['uptime']}"]
     if proc.get("command"):
-        lines.append(f"to start it again later: {proc['command']}")
+        lines.append("to start it again later: "
+                     + " ".join(shlex.quote(a) for a in proc["command"].split()))   # '*' stays quoted
     return lines
 
 
@@ -583,6 +591,21 @@ def _host_of(args):
     return "127.0.0.1"                     # rapid-mlx's own default
 
 
+def _trusted_of(args):
+    """The --trusted-hosts values in a slot's args, or None if the flag is absent."""
+    for i, a in enumerate(args):
+        if a == "--trusted-hosts":
+            vals = []
+            for v in args[i + 1:]:
+                if v.startswith("--"):
+                    break
+                vals += [x for x in v.split(",") if x]
+            return vals
+        if a.startswith("--trusted-hosts="):
+            return [x for x in a.split("=", 1)[1].split(",") if x]
+    return None
+
+
 def plan_start(target, model_name, replace=False):
     """Check everything before starting. Returns (plan, problem); one is None.
 
@@ -626,7 +649,8 @@ def plan_start(target, model_name, replace=False):
     if m["aux"]:
         warnings.append("this looks like an auxiliary model (embedder, speech, drafter), not a chat model")
     return {"name": t["name"], "port": t["port"], "model": serve_name, "size": m["size"],
-            "hint": slot["hint"] if slot else "", "host": _host_of(args), "log": log,
+            "hint": slot["hint"] if slot else "", "host": _host_of(args),
+            "trusted": _trusted_of(args), "log": log,
             "cmd": cmd, "warnings": warnings, "old": srv}, None
 
 
@@ -647,7 +671,9 @@ def describe_plan(p):
     hint = f"; slot hint {p['hint']}" if p["hint"] else ""
     where = ("this Mac only" if p["host"] in LOOPBACK
              else f"the network (--host {p['host']})")
-    shown = ["rapid-mlx"] + p["cmd"][1:]
+    if p["host"] not in LOOPBACK and p.get("trusted") and "*" in p["trusted"]:
+        where += ", any Host header accepted"
+    shown = [shlex.quote(a) for a in ["rapid-mlx"] + p["cmd"][1:]]   # pasteable: '*' stays quoted
     lines = []
     old = p.get("old")
     if old:
@@ -676,7 +702,7 @@ def launch(p, api_key=None):
     # Always exactly the key chosen at start, never one inherited from the shell.
     env["RAPID_MLX_API_KEY"] = api_key or DEFAULT_API_KEY
     with open(p["log"], "w") as f:            # a fresh log for every start
-        f.write(f"# started by mlxsw {time.strftime('%Y-%m-%d %H:%M:%S')}: {' '.join(p['cmd'])}\n")
+        f.write(f"# started by mlxsw {time.strftime('%Y-%m-%d %H:%M:%S')}: {' '.join(shlex.quote(a) for a in p['cmd'])}\n")
     out = open(p["log"], "a")                 # catches anything before --log-file takes over
     try:
         return subprocess.Popen(p["cmd"], stdin=subprocess.DEVNULL, stdout=out,

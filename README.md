@@ -1,14 +1,12 @@
 # mlxsw
 
-A small terminal switcher for Rapid-MLX model servers on an Apple Silicon Mac.
+A small terminal switcher for Rapid-MLX model servers on an Apple Silicon Mac. Needed in practice because rapid-mlx doesn't currently hotswap models in a running instance.
 
 It shows which models are cached, which are running on which port, whether each server is actually answering, and how memory is being used. All of it fits on one screen, refreshed live if you want.
 
 Built for a Mac Studio (M1 Ultra, 64 GB) that serves up to three slots of different sizes.
 
 > **Status:** a status view, plus **starting**, **stopping**, **restarting** and **switching** a slot's server.
-
-![mlxsw TUI](images/mlxsw-tui.png)
 
 ## Requirements
 
@@ -175,21 +173,26 @@ If Textual isn't installed, `mlxsw.py tui` says so and stops. The other modes ne
 
 All three rarely fit in 64 GB at the same time. They're defined so the capability is there; which ones run is up to you. A server on any other port still shows up, as `OTHER`.
 
-These are the built-in defaults. To use your own, create `~/.config/mlxsw/slots.json` (or `$XDG_CONFIG_HOME/mlxsw/slots.json`):
+These are the built-in defaults: three slots, each started with `--host 0.0.0.0 --trusted-hosts '*'` (see [Network access](#network-access)). To use your own, create `~/.config/mlxsw/slots.json` (or `$XDG_CONFIG_HOME/mlxsw/slots.json`):
 
 ```json
 {
   "slots": [
     { "name": "LARGE",  "port": 8000, "hint": "~30B",
-      "args": ["--host", "0.0.0.0", "--trusted-hosts", "localhost", "127.0.0.1", "192.168.1.20"] },
+      "args": ["--host", "0.0.0.0", "--trusted-hosts", "macstudio", "macstudio.local", "192.168.1.20",
+               "--log-level", "WARNING"] },
     { "name": "MIDDLE", "port": 8001, "hint": "~12B" },
-    { "name": "SMALL",  "port": 8002, "hint": "~2-4B" }
+    { "name": "SMALL",  "port": 8002, "hint": "~2-4B", "args": [] }
   ]
 }
 ```
 
 - `name` and `port` are required; `hint` is optional and shows next to an empty slot.
-- `args` is optional: extra `rapid-mlx serve` options used when mlxsw **starts** a model in that slot. Without it, the server is reachable from this Mac only (rapid-mlx's default host, `127.0.0.1`). The example opens LARGE to the network and accepts requests addressed to the Mac's IP; use your own IP there. `--port`, `--log-file`, `--disable-model-downloads` and `--api-key` aren't allowed here, because mlxsw sets the first three itself and asks for the key at start.
+- `args` is optional: extra `rapid-mlx serve` options used when mlxsw **starts** a model in that slot.
+  - **No `args`** (MIDDLE above): the built-in network default, `--host 0.0.0.0 --trusted-hosts '*'`.
+  - **Your own `args`** (LARGE above): used exactly as written. Nothing from the default is added, so include `--host` and `--trusted-hosts` yourself if you want network access.
+  - **`"args": []`** (SMALL above): nothing extra, which is rapid-mlx's own default: this Mac only.
+  - `--port`, `--log-file`, `--disable-model-downloads` and `--api-key` aren't allowed here, because mlxsw sets the first three itself and asks for the key at start.
 - Names are shown in capitals, and each name and port can only be used once.
 - If the file has a mistake, mlxsw stops and says what's wrong instead of guessing.
 - `--json` output and the TUI's first message both say where the slots came from.
@@ -202,6 +205,29 @@ Each slot has one of four statuses:
 | ◐ loading   | process is up but the port isn't answering yet (or it's stuck) |
 | ? foreign   | something answers on the port that `rapid-mlx ps` doesn't list |
 | ○ empty     | nothing there |
+
+### Network access
+
+**The built-in default is meant for an internal, protected network** (a home or lab LAN behind a firewall) where the Mac is an inference server for other machines. Without any configuration, a server started by mlxsw:
+
+- listens on all interfaces (`--host 0.0.0.0`), so other machines can reach it, and
+- accepts any `Host:` header (`--trusted-hosts '*'`), so clients can use the Mac's IP, its `.local` name or any DNS name.
+
+Why `*`: rapid-mlx checks the hostname in each request against `--trusted-hosts` (DNS-rebinding protection) and answers `400 Invalid host header` for any name not on the list. Its own default list is localhost only. A list of IPs fails as soon as a client uses a name, and the error doesn't say which name was wrong. `*` switches that check off, so the **API key is the only protection** (every server mlxsw starts has one; see [API key](#api-key)). With the default key `none`, anyone who can reach the port can use the server. On a network you don't fully trust, type a real key at the start prompt, or change the slot's `args`.
+
+**What you put in `slots.json` rules.** A slot with its own `args` gets exactly those, and the default isn't merged in. The start plan always shows who can reach the server ("reachable from: …") and the exact command before you confirm.
+
+Narrower setups, as `args` in `slots.json`:
+
+```jsonc
+"args": ["--host", "0.0.0.0", "--trusted-hosts", "macstudio", "macstudio.local", "192.168.1.20"]   // the network, but only these names
+"args": ["--host", "127.0.0.1"]                                                                       // this Mac only
+"args": []                                                                                             // this Mac only (rapid-mlx's default)
+```
+
+(Earlier versions started a slot without `args` for this Mac only. To get that back, give the slot `"args": []`.)
+
+If you start rapid-mlx by hand, quote the star so the shell doesn't expand it: `--trusted-hosts '*'`.
 
 ### RAM bar
 
