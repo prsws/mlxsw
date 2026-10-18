@@ -3,7 +3,7 @@
 Started with `mlxsw.py tui`. Needs `pip install textual`; the rest of
 mlxsw keeps working without it.
 
-Commands: /help, /refresh, /start, /restart, /switch, /stop, /quit.
+Commands: /help, /refresh, /info, /start, /restart, /switch, /stop, /quit.
 """
 import time
 
@@ -19,6 +19,7 @@ from textual.widgets import Footer, Input, RichLog, Static
 COMMANDS = {
     "/help": "show this list",
     "/refresh": "re-read the model list and status now",
+    "/info [SLOT]": "details a slot's server reports: memory, prefix cache, traffic (all running slots without SLOT)",
     "/start SLOT MODEL": "start a model that's on disk in an empty slot (asks for an API key, default \"none\", then y/N)",
     "/restart SLOT": "same model, fresh process: stop, then start (asks first)",
     "/switch SLOT MODEL": "stop the slot's server, then start MODEL in it (asks first)",
@@ -74,7 +75,7 @@ class MlxswApp(App):
 
     def suggestions(self):
         words = [c.split()[0] for c in COMMANDS] + list(ALIASES)
-        words += [f"/{verb} {s['name']}" for verb in ("stop", "restart") for s in self.core.SLOTS]
+        words += [f"/{verb} {s['name']}" for verb in ("info", "stop", "restart") for s in self.core.SLOTS]
         names = [m["alias"] or m["repo"] for m in (self.models or []) if not m["aux"]]
         for verb in ("start", "switch"):
             words += [f"/{verb} {s['name']} {n}" for s in self.core.SLOTS for n in names]
@@ -149,6 +150,21 @@ class MlxswApp(App):
         cmd = self.query_one("#cmd", Input)
         cmd.password = False
         cmd.placeholder = PLACEHOLDER
+
+    # ------------------------------------------------------------ info
+
+    @work(thread=True, group="info")
+    def show_info(self, target) -> None:
+        """Read-only: never asks anything, so it runs even while a stop/start is busy."""
+        slots, problem = self.core.info_state(target)
+        if problem:
+            self.say_from_thread(problem)
+            return
+        for i, s in enumerate(slots):
+            if i:
+                self.say_from_thread("")
+            for line in self.core.describe_info(s):
+                self.say_from_thread(line)
 
     # ------------------------------------------------------------ stop
 
@@ -261,6 +277,11 @@ class MlxswApp(App):
                 self.say(f"  [b]{escape(name):<19}[/b] {text}")
         elif cmd == "/refresh":
             self.action_refresh_now()
+        elif cmd == "/info":
+            if len(parts) > 2:
+                self.say("Usage: /info [SLOT]   (a slot name or port; without it, every running slot)")
+            else:
+                self.show_info(parts[1] if len(parts) == 2 else None)
         elif cmd in ("/stop", "/start", "/restart", "/switch") and self.busy:
             self.say("Another stop/start is in progress; wait for it to finish.")
         elif cmd == "/stop":

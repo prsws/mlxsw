@@ -39,6 +39,7 @@ mlxsw.py              # one-shot view
 mlxsw.py -w           # live view, refresh every 5 s (Ctrl-C to quit)
 mlxsw.py -w 2         # live view, refresh every 2 s
 mlxsw.py --json       # collected state as JSON, for scripts
+mlxsw.py info LARGE   # details for one slot (see "Slot details" below)
 ```
 
 Set `NO_COLOR=1` to turn off colors.
@@ -63,6 +64,7 @@ A full-screen shell with the live status on top, an output log, and a command bo
 |------------|------------|--------------|
 | `/help`    | `/h`, `/?` | list the commands |
 | `/refresh` | `/r`       | re-read the model list and status now (also Ctrl+R) |
+| `/info [SLOT]` |        | details a slot's server reports: memory, prefix cache, traffic (see below) |
 | `/start SLOT MODEL` |    | start a model that's on disk in an empty slot; asks for an API key (default `none`), then y/N (see below) |
 | `/restart SLOT` |       | same model, fresh process; asks first (see below) |
 | `/switch SLOT MODEL` |  | stop the slot's server, start MODEL in it; asks first (see below) |
@@ -147,6 +149,35 @@ When you confirm, it:
 It never force-kills. If the server doesn't stop in time (for example, while it's busy with a long request), mlxsw says so and gives you the `kill -9` command to use yourself if it's really stuck.
 
 If Textual isn't installed, `mlxsw.py tui` says so and stops. The other modes never need it.
+
+### Slot details
+
+```sh
+mlxsw.py info LARGE        # one slot (name or port)
+mlxsw.py info              # every slot with something running
+mlxsw.py info LARGE --json # the same, as JSON
+```
+
+In the shell it's `/info LARGE`, or `/info` for all. It only reads, so it never asks anything and works even while a start or stop is running.
+
+The status view stays one line per slot; this is where the longer story goes. It asks the server itself, on `/health` and `/metrics` (both answer without the API key):
+
+```
+LARGE :8000  serving  qwen3.8-27b-4bit  pid 37356  up 4h58m  [key]
+  state     ready · llm · batched
+  reach     the network (--host 0.0.0.0), trusted hosts: *
+  memory    metal 16.6 GiB now · 19.4 GiB peak · rss 15.5 GiB
+  prefix    5.0 GiB of 9.7 GiB cap · 8 entries · 1 hits / 6 misses · 12.9k tokens saved
+  traffic   42 requests · 0 running · 0 waiting · 81.2k prompt / 9.1k completion tokens
+  speed     last decode 23.4 tok/s · avg time to first token 0.30s
+  command   rapid-mlx serve qwen3.8-27b-4bit --host 0.0.0.0 --trusted-hosts '*' --port 8000 …
+  log       ~/Library/Logs/mlxsw/LARGE.log
+```
+
+- **memory:** `metal` is the memory Metal (the GPU side) has in use for this server right now; `peak` is the most it has used since start. `rss` is the process size the status view shows; the two are close, but not the same thing.
+- **prefix:** the server's reusable prompt cache (the KV state it keeps so a repeated prompt start isn't computed again). "not in use" when the server has no cap and nothing cached.
+- **reach** and **command** come from the server's own command line, so they're right even for a server you started by hand. **log** is shown only when the server writes to one with `--log-file`.
+- A line is left out when the server doesn't report it. An older rapid-mlx without `/metrics` gets a one-line note instead of the numbers.
 
 ## What it shows
 
@@ -252,6 +283,7 @@ Everything `rapid-mlx ls` reports. Chat LLMs come first, then aux models (embedd
 - Each slot's port is probed with `GET /v1/models` (2-second timeout).
 - `ps -o rss,command` gives each server's memory and its launch flags (such as `--embedding-model`).
 - `sysctl` and `vm_stat` give the memory breakdown.
+- `info` adds `GET /health` (JSON) and `GET /metrics` (Prometheus text) from the server, 3-second timeout each.
 - In live mode the model list is re-read once a minute. Everything else is read on every refresh.
 
 ## Known quirks
@@ -270,6 +302,7 @@ Everything `rapid-mlx ls` reports. Chat LLMs come first, then aux models (embedd
 - [x] Stop a slot's server (`stop` / `/stop`)
 - [x] Start a model in a slot (`start` / `/start`), always with an API key (default `none`)
 - [x] Restart a slot, or switch it to another model, in one step
+- [x] Slot details from the server's own `/health` and `/metrics` (`info` / `/info`)
 
 ## License
 

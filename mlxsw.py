@@ -534,6 +534,182 @@ def describe_server(t, srv):
     return lines
 
 
+# ---------------------------------------------------------------- info
+
+def _get_text(port, path, timeout=3.0):
+    """GET a path on the server. Returns (status, text); status None = no answer."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=timeout) as r:
+            return r.status, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, ""
+    except Exception:
+        return None, ""
+
+
+def parse_metrics(text):
+    """Prometheus text -> {name: value}. A name with labels keeps its first
+    sample, plus "name{label=...}" entries for each labelled sample."""
+    out = {}
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+(\S+)", line)
+        if not m:
+            continue
+        try:
+            val = float(m.group(3))
+        except ValueError:
+            continue
+        name, labels = m.group(1), m.group(2)
+        out.setdefault(name, val)
+        if labels:
+            out[name + labels] = val
+    return out
+
+
+def server_details(port):
+    """What the server says about itself on /health and /metrics. Both answer
+    without the API key in rapid-mlx 0.16; missing or refused -> None."""
+    h_status, h_text = _get_text(port, "/health")
+    m_status, m_text = _get_text(port, "/metrics")
+    health = None
+    if h_status == 200:
+        try:
+            health = json.loads(h_text)
+        except ValueError:
+            pass
+    metrics = parse_metrics(m_text) if m_status == 200 else None
+    return {"health": health, "health_status": h_status,
+            "metrics": metrics, "metrics_status": m_status}
+
+
+def _count(n):
+    if n is None:
+        return "-"
+    n = float(n)
+    for div, suf in ((1e9, "G"), (1e6, "M"), (1e3, "k")):
+        if n >= div:
+            return f"{n / div:.1f}{suf}"
+    return f"{n:.0f}"
+
+
+def describe_info(slot):
+    """Detail lines for one slot of collect(): the long form the status view has no room for."""
+    srv, proc, api = slot["server"], slot["proc"] or {}, slot["api"]
+    head = f"{slot['name']} :{slot['port']}  {slot['status']}"
+    if srv:
+        head += f"  {srv['model']}  pid {srv['pid']}  up {srv['uptime']}"
+    if api and api.get("auth"):
+        head += "  [key]"
+    lines = [head]
+    if slot["status"] == "empty":
+        lines.append("  nothing is running here")
+        return lines
+    d = slot.get("details") or {}
+    h, mt = d.get("health"), d.get("metrics")
+    label = lambda k: f"  {k:<9} "
+
+    if h:
+        bits = [h.get("state") or ("ready" if h.get("ready") else "not ready"),
+                h.get("model_type"), h.get("engine_type")]
+        lines.append(label("state") + " · ".join(str(b) for b in bits if b))
+    else:
+        lines.append(label("state") + f"no /health answer ({d.get('health_status') or 'no reply'})")
+
+    args = proc.get("command", "").split()
+    if args:
+        host = _host_of(args)
+        trusted = _trusted_of(args)
+        reach = "this Mac only" if host in LOOPBACK else f"the network (--host {host})"
+        if trusted is not None:
+            reach += ", trusted hosts: " + (" ".join(trusted) or "-")
+        lines.append(label("reach") + reach)
+
+    if mt is None:
+        lines.append(label("metrics") + f"no /metrics answer ({d.get('metrics_status') or 'no reply'}); "
+                     "an older rapid-mlx, or not up yet")
+    else:
+        g = mt.get
+        mem = [f"metal {human(g('rapid_mlx_metal_active_memory_bytes'))} now",
+               f"{human(g('rapid_mlx_metal_peak_memory_bytes'))} peak"]
+        if g("rapid_mlx_metal_cache_memory_bytes"):
+            mem.append(f"{human(g('rapid_mlx_metal_cache_memory_bytes'))} metal cache")
+        if proc.get("rss"):
+            mem.append(f"rss {human(proc['rss'])}")
+        lines.append(label("memory") + " · ".join(mem))
+
+        cap, cur = g("rapid_mlx_prefix_cache_cap_bytes"), g("rapid_mlx_prefix_cache_current_bytes")
+        if cap or cur:
+            pfx = f"{human(cur or 0)} of {human(cap)} cap" if cap else f"{human(cur)}"
+            if g("rapid_mlx_prefix_cache_radix_entries") is not None:
+                pfx += f" · {_count(g('rapid_mlx_prefix_cache_radix_entries'))} entries"
+            pfx += (f" · {_count(g('rapid_mlx_prefix_cache_hits_total'))} hits"
+                    f" / {_count(g('rapid_mlx_prefix_cache_misses_total'))} misses"
+                    f" · {_count(g('rapid_mlx_prefix_cache_tokens_saved_total'))} tokens saved")
+        else:
+            pfx = "not in use (no cap, nothing cached)"
+        lines.append(label("prefix") + pfx)
+
+        traffic = (f"{_count(g('rapid_mlx_requests_processed_total'))} requests"
+                   f" · {_count(g('rapid_mlx_requests_running'))} running"
+                   f" · {_count(g('rapid_mlx_requests_waiting'))} waiting"
+                   f" · {_count(g('rapid_mlx_prompt_tokens_total'))} prompt"
+                   f" / {_count(g('rapid_mlx_completion_tokens_total'))} completion tokens")
+        lines.append(label("traffic") + traffic)
+
+        speed = []
+        if g("rapid_mlx_model_decode_tokens_per_second_last") is not None:
+            speed.append(f"last decode {g('rapid_mlx_model_decode_tokens_per_second_last'):.1f} tok/s")
+        n, total = g("rapid_mlx_model_ttft_seconds_count"), g("rapid_mlx_model_ttft_seconds_sum")
+        if n:
+            speed.append(f"avg time to first token {total / n:.2f}s")
+        if speed:
+            lines.append(label("speed") + " · ".join(speed))
+
+    if proc.get("command"):
+        lines.append(label("command") + " ".join(shlex.quote(a) for a in args))
+    log = next((args[i + 1] for i, a in enumerate(args[:-1]) if a == "--log-file"), None)
+    if log:                                   # only what this server actually writes to
+        lines.append(label("log") + log.replace(os.path.expanduser("~"), "~", 1))
+    return lines
+
+
+def info_state(target=None):
+    """collect() plus /health and /metrics for the slot asked for (or every
+    slot with something running). Returns (slots, problem)."""
+    st = collect([])        # no model list needed: skips the slow `rapid-mlx ls`
+    if target is not None:
+        t = resolve_target(target)
+        if not t:
+            names = ", ".join(s["name"] for s in SLOTS)
+            return None, f"no slot called {target!r}. Slots: {names} (or give a port number)."
+        slots = [s for s in st["slots"] if s["port"] == t["port"]]
+        if not slots:                      # a port that isn't a slot and has nothing on it
+            slots = [{"name": t["name"], "port": t["port"], "status": "empty", "hint": "",
+                      "server": None, "api": None, "proc": None}]
+    else:
+        slots = [s for s in st["slots"] if s["status"] != "empty"]
+        if not slots:
+            return None, "nothing from rapid-mlx is running in any slot."
+    for s in slots:
+        if s["status"] != "empty":
+            s["details"] = server_details(s["port"])
+    return slots, None
+
+
+def cmd_info(target=None, as_json=False):
+    slots, problem = info_state(target)
+    if problem:
+        print(f"mlxsw: {problem}")
+        return 1
+    if as_json:
+        print(json.dumps(slots, indent=2, default=str))
+        return 0
+    print("\n\n".join("\n".join(describe_info(s)) for s in slots))
+    return 0
+
+
 def cmd_stop(target, assume_yes=False):
     t = resolve_target(target)
     if not t:
@@ -831,8 +1007,9 @@ def find_rapid_mlx():
 
 def main():
     ap = argparse.ArgumentParser(description="rapid-mlx slot status and control")
-    ap.add_argument("command", nargs="?", choices=["tui", "stop", "start", "restart", "switch"],
+    ap.add_argument("command", nargs="?", choices=["tui", "info", "stop", "start", "restart", "switch"],
                     help="tui: interactive shell (optional, needs `pip install textual`); "
+                         "info [SLOT]: details a slot's server reports (memory, prefix cache, traffic); "
                          "stop SLOT; start SLOT MODEL; restart SLOT (same model, fresh process); "
                          "switch SLOT MODEL (stop the slot's server, start MODEL)")
     ap.add_argument("target", nargs="?", metavar="SLOT",
@@ -853,7 +1030,9 @@ def main():
         ap.error("usage: mlxsw.py switch SLOT MODEL   e.g.  mlxsw.py switch LARGE qwen3-coder-30b-4bit")
     if args.command == "restart" and (not args.target or args.model):
         ap.error("usage: mlxsw.py restart SLOT   e.g.  mlxsw.py restart SMALL")
-    if args.target and args.command not in ("stop", "start", "restart", "switch"):
+    if args.command == "info" and args.model:
+        ap.error("usage: mlxsw.py info [SLOT]   e.g.  mlxsw.py info LARGE")
+    if args.target and args.command not in ("info", "stop", "start", "restart", "switch"):
         ap.error(f"unexpected argument {args.target!r}")
 
     # Check the optional dependency before touching rapid-mlx, so the
@@ -869,6 +1048,8 @@ def main():
     SLOTS, CONFIG_SOURCE = load_slots()
     RAPID_MLX, version = find_rapid_mlx()
 
+    if args.command == "info":
+        sys.exit(cmd_info(args.target, as_json=args.json))
     if args.command == "stop":
         sys.exit(cmd_stop(args.target, assume_yes=args.yes))
     if args.command == "start":
