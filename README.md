@@ -4,7 +4,9 @@ A small terminal switcher for Rapid-MLX model servers on an Apple Silicon Mac. N
 
 It shows which models are cached, which are running on which port, whether each server is actually answering, and how memory is being used. All of it fits on one screen, refreshed live if you want.
 
-Built for a Mac Studio (M1 Ultra, 64 GB) that serves up to three slots of different sizes.
+Built for a Mac Studio (M1 Ultra, 64 GB) that serves up to three slots of different sizes, dedicated as inference server.
+
+![mlxsw TUI screenshot](images/mlxsw-tui.png)
 
 > **Status:** a status view, plus **starting**, **stopping**, **restarting** and **switching** a slot's server.
 
