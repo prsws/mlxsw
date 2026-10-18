@@ -157,6 +157,49 @@ def probe(port, timeout=2.0):
         return None
 
 
+def healthz(port, timeout=2.0):
+    """rapid-mlx's liveness probe: constant cost, no API key, and (unlike
+    /v1/models) it never touches the engine. Returns
+      {"ready": bool, "draining": bool, "model": name}  -- answering
+      "unsupported"                                       -- 404: an older rapid-mlx
+      None                                                -- nothing answering"""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=timeout) as r:
+            data = json.load(r)
+        return {"ready": bool(data.get("ready")), "draining": False, "model": data.get("model_name")}
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return "unsupported"
+        if e.code == 503:              # SIGTERM seen: finishing in-flight requests, then exits
+            try:
+                data = json.load(e)
+            except Exception:
+                data = {}
+            return {"ready": False, "draining": data.get("status", "draining") == "draining",
+                    "model": data.get("model_name")}
+        return None
+    except Exception:
+        return None
+
+
+# /v1/models is asked once per server process, not on every refresh: what it
+# tells us (model ids, MoE, whether a key is set) can't change while the
+# process lives. Keyed by (port, pid).
+_API_SEEN = {}
+
+
+def api_info(port, pid):
+    key = (port, pid)
+    if pid is not None and key in _API_SEEN:
+        return _API_SEEN[key]
+    api = probe(port)
+    if api is not None and pid is not None:
+        for k in [k for k in _API_SEEN if k[0] == port]:   # forget the port's old process
+            del _API_SEEN[k]
+        _API_SEEN[key] = api
+    return api
+
+
 def proc_info(pid):
     out = run(["/bin/ps", "-ww", "-o", "rss=,command=", "-p", str(pid)], timeout=5).strip()
     if not out or out.startswith("__error__"):
@@ -267,17 +310,27 @@ def collect(models=None):
     for slot in SLOTS + [{"name": "OTHER", "port": p, "hint": ""}
                          for p in sorted(by_port) if p not in slot_ports]:
         srv = by_port.get(slot["port"])
-        api = probe(slot["port"])
-        proc = proc_info(srv["pid"]) if srv else None
-        if srv and api:
+        pid = srv["pid"] if srv else None
+        hz = healthz(slot["port"])
+        if hz == "unsupported":          # older rapid-mlx: /v1/models on every refresh, as before
+            hz, api = None, probe(slot["port"])
+            up = api is not None
+        else:
+            up = bool(hz and hz["ready"])
+            api = api_info(slot["port"], pid) if up else None
+        proc = proc_info(pid) if srv else None
+        if hz and hz["draining"]:
+            status = "stopping"      # SIGTERM seen: finishing what it has, then exits
+        elif srv and up:
             status = "serving"
         elif srv:
-            status = "loading"       # process up, API not answering yet (or wedged)
-        elif api:
+            status = "loading"       # process up, not ready yet (or wedged)
+        elif up or hz:
             status = "foreign"       # something answers on the port, not in rapid-mlx ps
         else:
             status = "empty"
-        slots.append({**slot, "status": status, "server": srv, "api": api, "proc": proc})
+        slots.append({**slot, "status": status, "server": srv, "api": api, "proc": proc,
+                      "healthz": hz})
 
     for m in models:
         m["loaded_on"] = [
@@ -339,6 +392,7 @@ def bar(frac, width=24):
 STATUS = {
     "serving": lambda: green("● serving"),
     "loading": lambda: yellow("◐ loading"),
+    "stopping": lambda: yellow("◌ stopping"),
     "foreign": lambda: magenta("? foreign"),
     "empty": lambda: dim("○ empty"),
 }
@@ -910,6 +964,13 @@ def _tail(path, n=12):
         return []
 
 
+def is_ready(port):
+    hz = healthz(port, timeout=1.0)
+    if hz == "unsupported":
+        return probe(port, timeout=1.0) is not None
+    return bool(hz and hz["ready"])
+
+
 def wait_ready(p, proc, timeout=START_TIMEOUT, say=print):
     """Wait until the new server answers, or exits, or time runs out."""
     t0, last = time.time(), 0.0
@@ -920,7 +981,7 @@ def wait_ready(p, proc, timeout=START_TIMEOUT, say=print):
             for ln in _tail(p["log"]):
                 say("  " + ln)
             return False
-        if probe(p["port"], timeout=1.0):
+        if is_ready(p["port"]):
             say(f"serving: {p['model']} on {p['name']} :{p['port']} after {elapsed:.0f}s (pid {proc.pid})")
             return True
         if elapsed >= timeout:

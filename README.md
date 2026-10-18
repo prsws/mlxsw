@@ -107,7 +107,7 @@ Every server mlxsw starts has an API key.
 - Your own key goes to the server through the `RAPID_MLX_API_KEY` environment variable, **never** on the command line, so it doesn't appear in `ps`, in the log or on screen. mlxsw never stores it. (The default `none` is public, so mlxsw shows it.)
 - The server always gets exactly the key chosen at start; a `RAPID_MLX_API_KEY` set in your shell is ignored, except with `-y`.
 - With `-y` there's no question: the key comes from `RAPID_MLX_API_KEY` if your shell has it, otherwise `none`.
-- A server with a key shows as `● serving … [key]`, since mlxsw's own status check is refused without it.
+- A server with a key shows as `● serving … [key]`: mlxsw asks `/v1/models` once per server process, and a server with a key refuses it.
 
 ### Restarting and switching
 
@@ -230,12 +230,13 @@ These are the built-in defaults: three slots, each started with `--host 0.0.0.0 
 - If the file has a mistake, mlxsw stops and says what's wrong instead of guessing.
 - `--json` output and the TUI's first message both say where the slots came from.
 
-Each slot has one of four statuses:
+Each slot has one of five statuses:
 
 | Status      | Meaning |
 |-------------|---------|
-| ● serving   | listed by `rapid-mlx ps` **and** answering `GET /v1/models` |
-| ◐ loading   | process is up but the port isn't answering yet (or it's stuck) |
+| ● serving   | listed by `rapid-mlx ps` **and** `GET /healthz` says ready |
+| ◐ loading   | process is up but not ready yet: loading or warming up (or it's stuck) |
+| ◌ stopping  | it got SIGTERM and is draining: finishing the requests it has, taking no new ones, then it exits (`/healthz` answers 503) |
 | ? foreign   | something answers on the port that `rapid-mlx ps` doesn't list |
 | ○ empty     | nothing there |
 
@@ -280,7 +281,9 @@ Everything `rapid-mlx ls` reports. Chat LLMs come first, then aux models (embedd
 ## How it works
 
 - `rapid-mlx ls` and `rapid-mlx ps` have no JSON output, so their tables are parsed with regular expressions. Long aliases shift the columns and long repo names get truncated with `...`, which the parser handles.
-- Each slot's port is probed with `GET /v1/models` (2-second timeout).
+- Each slot's port is checked with `GET /healthz` (2-second timeout), rapid-mlx's liveness probe: constant cost, no API key, and it doesn't touch the engine. It says whether the server is ready, and answers 503 while it drains after SIGTERM. `start`, `restart` and `switch` wait for it to say ready.
+- `GET /v1/models` is asked once per server process (not on every refresh), for the model ids, MoE and whether a key is set. A rapid-mlx without `/healthz` (404) gets `/v1/models` on every refresh instead, as before.
+- Each check is still a line in the server's access log (`GET /healthz … 200 OK`).
 - `ps -o rss,command` gives each server's memory and its launch flags (such as `--embedding-model`).
 - `sysctl` and `vm_stat` give the memory breakdown.
 - `info` adds `GET /health` (JSON) and `GET /metrics` (Prometheus text) from the server, 3-second timeout each.
